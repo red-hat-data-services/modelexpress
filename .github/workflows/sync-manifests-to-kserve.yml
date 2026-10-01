@@ -5,10 +5,10 @@ on:
     branches:
       - 'rhoai-[0-9].[0-9]**'
     types: [closed]
-    paths: ['config/manifests/**']
+    paths: ['config/manifests/**', '.github/workflows/sync-manifests-to-kserve.yml']
   push:
     branches: [main]
-    paths: ['config/manifests/**']
+    paths: ['config/manifests/**', '.github/workflows/sync-manifests-to-kserve.yml']
   workflow_dispatch:
 
 permissions:
