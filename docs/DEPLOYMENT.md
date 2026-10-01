@@ -334,11 +334,11 @@ FIPS.
 
 | Env Var | Flag | Description |
 |---------|------|-------------|
-| `MODEL_EXPRESS_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
-| `MODEL_EXPRESS_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
-| `MODEL_EXPRESS_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the OpenShift `VersionTLS12` spelling. OpenSSL's default when unset. |
-| `MODEL_EXPRESS_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in an OpenShift `tlsSecurityProfile`. OpenSSL's default when unset. |
-| `MODEL_EXPRESS_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
+| `MX_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
+| `MX_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
+| `MX_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the OpenShift `VersionTLS12` spelling. OpenSSL's default when unset. |
+| `MX_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in an OpenShift `tlsSecurityProfile`. OpenSSL's default when unset. |
+| `MX_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
 
 Certificate and key must be set together. Version and cipher settings without a
 certificate fail config validation. A cipher list in which the backend knows none of the
@@ -384,7 +384,7 @@ endpoint from `MODEL_EXPRESS_ENDPOINT` or `--endpoint`; the Python client reads
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `MODEL_EXPRESS_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
+| `MX_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
 
 On OpenShift a service-ca signed certificate verifies against the bundle injected into any
 ConfigMap annotated `service.beta.openshift.io/inject-cabundle: "true"`; mount it into the
@@ -630,6 +630,45 @@ deploy, and need `metrics.clientPodMonitor` with a selector you supply.
 See [METRICS.md](METRICS.md) for the discovery models, the alert runbook and the
 dashboard.
 
+### FSDP refit tensor precision
+
+The FSDP publisher transfers floating tensors in BF16 by default. Frameworks
+whose models require higher precision for selected tensors can provide exact
+state-dict names through the trainer context:
+
+```python
+import torch
+from modelexpress_rl import FSDPTrainerContext, ModelExpressTrainerConfig
+
+config = ModelExpressTrainerConfig(
+    engine_context=FSDPTrainerContext(
+        wire_dtype_overrides={"model.layers.0.mlp.router.selection_bias": torch.float32},
+    ),
+    model_name="my-model",
+    device_id=0,
+    server_url="localhost:8001",
+)
+```
+
+Model-specific name selection belongs to the framework. Overrides accept
+`torch.float16`, `torch.bfloat16`, and `torch.float32`; these are unquantized
+tensor dtypes, not packed FP8/FP4 format support. Other tensors retain the BF16
+default. An unknown name or non-floating tensor is rejected rather than silently
+ignoring a precision exception. Names must match the state dict supplied by that
+trainer, including any wrapper prefixes.
+
+`COPY_TO_DEVICE` registers persistent buffers in each selected dtype and copies
+subsequent versions into those buffers. `IN_PLACE` requires the source dtype to
+match the selected dtype. The adapter copies the override mapping at creation;
+changing the caller's mapping does not change an active adapter. A source dtype
+change after initialization is rejected before writing a new version. Recreate
+the adapter and rebind when the model's precision policy changes.
+
+Manifests describe each served tensor's dtype and element size, and byte totals
+sum their actual sizes. Existing receiver dtype conversion remains available,
+but casting a rounded BF16 value back to FP32 cannot recover source precision.
+Verify installed parameters and generation separately from transfer completion.
+
 ### Dynamo Model Cache Deployment
 
 For deploying ModelExpress alongside Dynamo with a vLLM worker:
@@ -723,6 +762,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 |----------|---------|-------------|
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
+| `MX_MODEL_NAME_OVERRIDE` | (unset) | Override vLLM's MX model identity without changing its model-loading path. Set before worker startup and use the same name for RL trainers and WeightVersions. Unset or empty preserves vLLM's configured model path/ID, including rewritten S3 cache paths. See [S3 Delta Weight Refit](S3_DELTA_WEIGHT_REFIT.md). |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Initial-load policy. `RL` uses exact desired-version P2P and canonical S3 replay when `MX_REFIT_DESIRED_VERSION_UID` is set; otherwise it tries `MX_MODEL_URI` and then the engine-native loader. vLLM speculative draft models are rejected because the desired UID identifies only the main model. |
 | `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact immutable version required by the RL initial-load policy. When set, startup fails if neither desired-version P2P nor S3 replay succeeds; version-agnostic fallbacks are not allowed. |
@@ -759,7 +799,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact path for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
@@ -1238,6 +1278,35 @@ kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-multi-
 ```
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
+
+#### Sharing One Server Across Namespaces
+
+Workers do not have to run in the server's namespace. One server can back workers in several workload namespaces, and every worker that talks to it joins the same P2P source pool — a namespace added later boots over RDMA from the workers already registered with that server instead of reading the weights from storage. Running a separate server per namespace splits the pool instead: each namespace then loads from storage on its first start and shares sources only within itself.
+
+Only the worker's server address changes. A worker outside the server's namespace has to qualify the Service name with the server's namespace, because the Pod's DNS search path resolves a bare name only within its own namespace:
+
+```yaml
+# Worker pods, in any namespace.
+# <server-service>   the server's Service name — "modelexpress-server" in the
+#                    example manifests, the Helm release's fullname when installed
+#                    from the chart.
+# <server-namespace> the namespace that Service lives in, not the worker's.
+env:
+  - name: MX_SERVER_ADDRESS
+    value: "<server-service>.<server-namespace>.svc.cluster.local:8001"
+  - name: MODEL_EXPRESS_URL   # deprecated alias; keep identical during the transition
+    value: "<server-service>.<server-namespace>.svc.cluster.local:8001"
+```
+
+For a server deployed as `modelexpress-server` in a namespace named `modelexpress`, that is `modelexpress-server.modelexpress.svc.cluster.local:8001`. Workers that do run in the server's namespace can keep the short `modelexpress-server:8001` used by the example manifests.
+
+`MX_METADATA_NAMESPACE` is a server setting, not a worker one: it selects the namespace the server writes `ModelMetadata` and `ModelCacheEntry` CRs into, and the client does not read it. The metadata RBAC in [Distributed backend selection](#distributed-backend-selection) is likewise needed only by the server — workers publish and list sources over gRPC and never call the Kubernetes API, and the weight transfer is Pod-to-Pod RDMA. The source pool is scoped by the server a worker connects to and by `SourceIdentity`, not by the worker's own namespace.
+
+Three consequences:
+
+- **Ownership falls back to the reaper.** Kubernetes does not let a Pod own a namespaced object in another namespace, so `ModelMetadata` CRs published by workers outside the server's `MX_METADATA_NAMESPACE` carry no `ownerReference` — the cross-namespace identity behavior described under [Distributed backend selection](#distributed-backend-selection). Rather than disappearing with the Pod, those records go STALE after `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s) and are garbage-collected after `MX_GC_TIMEOUT_SECS` (default 3600s); see [Source Lifecycle](metadata.md#source-lifecycle). Setting `POD_NAME` / `POD_UID` / `POD_NAMESPACE` on such workers is harmless — ignored for ownership, and used if the worker later moves into the server's namespace.
+- **The auth allowlist is per ServiceAccount.** `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` is an exact-match list of `<namespace>:<serviceaccount>`, so under `enforce` a shared server needs one entry per allowed ServiceAccount in each workload namespace — two entries for `vllm:worker` and `vllm:router`, not one for `vllm`. Every workload namespace adds its own entries. See [ServiceAccount Authentication](#serviceaccount-authentication).
+- **Model files stay per namespace.** PersistentVolumeClaims are namespaced, and the engine reads the model's config and tokenizer from the `--model` path even when every weight arrives over RDMA. That path must still resolve inside the worker's own namespace.
 
 #### K8s-Service-Routed Backend
 
