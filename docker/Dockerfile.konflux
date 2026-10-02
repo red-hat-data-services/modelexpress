@@ -43,7 +43,7 @@ RUN cargo build --release --package modelexpress-server --bin modelexpress-serve
         --no-default-features --features openssl \
     && cp target/release/modelexpress-server /modelexpress-server
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal-pqc:latest
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest
 
 RUN microdnf install -y --nodocs ca-certificates openssl-libs \
     && microdnf clean all
