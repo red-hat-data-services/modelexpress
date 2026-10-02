@@ -1,0 +1,32 @@
+# Input spec for rpm-lockfile-prototype. Generates rpms.lock.yaml, which
+# Konflux's prefetch-dependencies task uses to populate RPMs for the
+# hermetic build in docker/Dockerfile.konflux without network access.
+#
+# Regenerate with:
+#   podman run --rm -v "$(pwd):/workdir:Z" \
+#     quay.io/konflux-ci/rpm-lockfile-prototype:latest \
+#     /workdir/rpms.in.yaml --outfile /workdir/rpms.lock.yaml \
+#     --arch x86_64 --arch aarch64
+contentOrigin:
+  repos:
+    - repoid: ubi-9-baseos-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/baseos/os
+    - repoid: ubi-9-appstream-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/appstream/os
+    - repoid: ubi-9-codeready-builder-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/codeready-builder/os
+
+packages:
+  - rust
+  - cargo
+  - cmake
+  - gcc
+  - gcc-c++
+  - perl
+  - openssl-devel
+  - git-core
+  - unzip
+
+arches:
+  - x86_64
+  - aarch64

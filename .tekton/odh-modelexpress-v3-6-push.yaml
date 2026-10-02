@@ -38,6 +38,8 @@ spec:
     value: .
   - name: hermetic
     value: true
+  - name: prefetch-input
+    value: '{"type": "rpm"}'
   - name: image-expires-after
     value: 5d
   - name: enable-slack-failure-notification
