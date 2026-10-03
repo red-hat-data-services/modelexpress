@@ -7,7 +7,7 @@
 # Runtime stage uses ubi-minimal for a small footprint with microdnf
 # available if additional packages are ever needed.
 
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:bcbf1fe577df63bd975ea19ebae604b5f072e1833b2bde417a0ffd4afd938b96 AS build
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:094ea2ecfd3225af8f93807b99daa9ff33710fc705ebdf6e8466f46ed605585c AS build
 
 # openssl-devel: FIPS builds link RHEL's openssl (ci/check-fips-crypto.sh)
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
@@ -20,7 +20,7 @@ RUN cargo build --release --package modelexpress-operator-openshift \
         --no-default-features --features openssl \
     && cp target/release/modelexpress-operator-openshift /modelexpress-operator
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7c372902c8d211db2d25c8277ba534a73b92742a334874dced829a63b0f21221
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:1d7c5517a4a1a8e2688620b39ee980e82505ca1ab7ae5541b5463120ae9b3897
 
 RUN microdnf install -y --nodocs ca-certificates openssl-libs \
     && microdnf clean all
