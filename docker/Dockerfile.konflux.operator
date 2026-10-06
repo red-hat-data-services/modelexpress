@@ -7,7 +7,7 @@
 # Runtime stage uses ubi-minimal for a small footprint with microdnf
 # available if additional packages are ever needed.
 
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:094ea2ecfd3225af8f93807b99daa9ff33710fc705ebdf6e8466f46ed605585c AS build
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:803a35a0a8e6a84e8d8b00ae862ac501526211c9b11a61b0fda2afe9c6e4834f AS build
 
 # openssl-devel: FIPS builds link RHEL's openssl (ci/check-fips-crypto.sh)
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
