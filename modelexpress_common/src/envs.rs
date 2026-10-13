@@ -88,6 +88,8 @@ pub const HF_HUB_OFFLINE: &str = "HF_HUB_OFFLINE";
 /// HuggingFace Hub endpoint override. Read directly by the `hf_hub` crate;
 /// registered here for reference (ModelExpress only sets it in tests).
 pub const HF_ENDPOINT: &str = "HF_ENDPOINT";
+/// Suppresses use of the locally cached HuggingFace token.
+pub const HF_HUB_DISABLE_IMPLICIT_TOKEN: &str = "HF_HUB_DISABLE_IMPLICIT_TOKEN";
 
 // ── NGC ─────────────────────────────────────────────────────────────────────
 /// Base URL for the NGC artifact/download API.
@@ -243,6 +245,14 @@ pub fn hf_offline() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the locally cached HuggingFace token must not be used implicitly, via
+/// [`HF_HUB_DISABLE_IMPLICIT_TOKEN`]. Same truthy values as [`hf_offline`].
+pub fn hf_implicit_token_disabled() -> bool {
+    env::var(HF_HUB_DISABLE_IMPLICIT_TOKEN)
+        .map(|v| matches!(v.to_uppercase().as_str(), "1" | "ON" | "YES" | "TRUE"))
+        .unwrap_or(false)
+}
+
 /// NGC API base URL: [`NGC_API_ENDPOINT`] or [`DEFAULT_NGC_API_BASE`].
 pub fn ngc_api_base() -> String {
     env::var(NGC_API_ENDPOINT).unwrap_or_else(|_| DEFAULT_NGC_API_BASE.to_string())
@@ -386,6 +396,10 @@ mod tests {
         assert_eq!(HF_HUB_CACHE, "HF_HUB_CACHE");
         assert_eq!(HF_HUB_OFFLINE, "HF_HUB_OFFLINE");
         assert_eq!(HF_ENDPOINT, "HF_ENDPOINT");
+        assert_eq!(
+            HF_HUB_DISABLE_IMPLICIT_TOKEN,
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN"
+        );
         assert_eq!(NGC_API_ENDPOINT, "NGC_API_ENDPOINT");
         assert_eq!(NGC_AUTH_ENDPOINT, "NGC_AUTH_ENDPOINT");
         assert_eq!(NGC_API_KEY, "NGC_API_KEY");
