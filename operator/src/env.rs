@@ -294,6 +294,7 @@ mod tests {
             tolerations: None,
             affinity: None,
             network_policy: None,
+            pod_security_context: None,
             service_account_name: None,
             image_pull_secrets: None,
             probes: None,

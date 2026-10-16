@@ -139,6 +139,11 @@ fn full_spec() -> ModelExpressServerSpec {
             ],
         }),
         service_account_name: None,
+        pod_security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
+            run_as_user: Some(65532),
+            fs_group: Some(65532),
+            ..Default::default()
+        }),
         image_pull_secrets: Some(vec![k8s_openapi::api::core::v1::LocalObjectReference {
             name: "registry-creds".into(),
         }]),

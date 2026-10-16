@@ -110,7 +110,9 @@ spec:
       nodeSelector:
         kubernetes.io/arch: arm64
       securityContext:
+        fsGroup: 65532
         runAsNonRoot: true
+        runAsUser: 65532
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: mx-full-server

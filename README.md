@@ -196,6 +196,22 @@ helm install modelexpress ./helm --namespace modelexpress --create-namespace
 
 Override [values-production.yaml](helm/values-production.yaml) for your env. Full config: [helm/README.md](helm/README.md).
 
+### ModelExpress operator: server permissions
+
+For `ModelExpressServer` resources, normally leave `spec.podSecurityContext` unset on OpenShift so the platform can assign a permitted user ID and filesystem group through its Security Context Constraints (SCCs).
+
+On Kubernetes platforms without automatic identity assignment, a server image that defaults to root may fail the operator's non-root requirement. Configure a permitted non-root user ID and a filesystem group appropriate for the image and cache volume:
+
+```yaml
+spec:
+  podSecurityContext:
+    runAsUser: 1000
+    fsGroup: 1000
+```
+
+> [!NOTE]
+> `1000` is an example, not a universal default. Verify that the server starts and can write its cache. Volume permissions depend on the storage driver; these settings do not bypass cluster security policy or the container's non-root restriction.
+
 ### P2P GPU Transfer (vLLM)
 
 ```bash
