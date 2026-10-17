@@ -8,9 +8,9 @@
 #   ./docker/konflux/lock-rpms.sh server
 contentOrigin:
   repos:
-    - repoid: ubi-9-baseos-rpms
+    - repoid: ubi-9-for-$basearch-baseos-rpms
       baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/baseos/os/
-    - repoid: ubi-9-appstream-rpms
+    - repoid: ubi-9-for-$basearch-appstream-rpms
       baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/appstream/os/
 packages:
   # build
