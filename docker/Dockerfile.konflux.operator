@@ -32,7 +32,7 @@ RUN __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly CARGO_BUILD_SBOM=true 
     && ci/check-fips-crypto.sh target/release/modelexpress-operator-openshift \
     && cp target/release/modelexpress-operator-openshift /modelexpress-operator
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:c4c285d42941ebb2bd4da878479008e1e4536bb599aad1dbe568f89de9053661
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.8-1791946957@sha256:b3a0b012de0c578082e1bc5b01c8bc27461b4eeb571a0b1a2b21a07dbd845a62
 
 RUN microdnf install -y --nodocs ca-certificates openssl-libs \
     && microdnf clean all
