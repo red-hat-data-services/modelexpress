@@ -5,12 +5,12 @@
 
 #![allow(clippy::result_large_err)] // Match tonic service validation helpers.
 
+use modelexpress_common::digest::sha256_hex;
 use modelexpress_common::grpc::refit::{
     GetWeightVersionShardManifestRequest, TrainerTensorsMetadata, WeightVersionShard,
     refit_worker_service_client::RefitWorkerServiceClient,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tonic::Status;
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -76,9 +76,8 @@ pub(super) async fn validate_publication(
         })
         .await?
         .into_inner();
-    if response.manifest_digest != shard.manifest_digest
-        || format!("{:x}", Sha256::digest(&response.manifest)) != shard.manifest_digest
-    {
+    let digest = sha256_hex(&response.manifest).map_err(|e| Status::internal(e.to_string()))?;
+    if response.manifest_digest != shard.manifest_digest || digest != shard.manifest_digest {
         return Err(invalid("publication manifest digest does not match"));
     }
     let mut manifest: BoundManifest = serde_json::from_slice(&response.manifest)
@@ -104,7 +103,8 @@ pub(super) async fn validate_publication(
     // Value serialization uses canonical sorted object keys, matching bind-time encoding.
     let value = serde_json::to_value(&manifest).map_err(|_| invalid("invalid bound coverage"))?;
     let bytes = serde_json::to_vec(&value).map_err(|_| invalid("invalid bound coverage"))?;
-    if format!("{:x}", Sha256::digest(bytes)) != metadata.logical_shard_id {
+    if sha256_hex(&bytes).map_err(|e| Status::internal(e.to_string()))? != metadata.logical_shard_id
+    {
         return Err(invalid(
             "publication coverage differs from bound logical shard",
         ));

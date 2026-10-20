@@ -18,7 +18,7 @@ tls-openssl = [
     "dep:axum-server",
     "axum-server/tls-openssl",
 ]
-tls-rustls = ["kube/rustls-tls"]
+tls-rustls = ["kube/rustls-tls", "dep:sha2"]
 
 [dependencies]
 # unstable-runtime: Controller::owns_stream, needed to feed metadata-only
@@ -39,7 +39,7 @@ chrono = { workspace = true }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 http = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 moka = { workspace = true }
 openssl = { workspace = true, optional = true }
 axum-server = { version = "0.8", default-features = false, optional = true }
