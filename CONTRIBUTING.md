@@ -13,7 +13,6 @@ For technical architecture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). 
 
 - **Rust**: Latest stable version (recommended: 1.90+)
 - **Cargo**: Rust's package manager (included with Rust)
-- **protoc**: Protocol Buffers compiler
 - **Python 3.10+** (optional): For the P2P client library
 - **C++ compiler** (optional, `g++` or any compiler in `$CXX`): To build the `modelexpress.vmm._alloc_ext` extension that enables the `MX_VMM_ARENA=1` fast path. Without a working compiler the Python install still succeeds and `MX_VMM_ARENA=1` falls back to the pool-reg path at runtime with a warning
 - **Docker** (optional): For containerized deployment

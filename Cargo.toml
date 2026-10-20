@@ -54,6 +54,9 @@ object-store-reqwest = { package = "reqwest", version = "0.13", default-features
 # `expect_used`, ruling out the `register_*!(...).unwrap()` idiom of the tikv crate.
 prometheus-client = { version = "0.25", default-features = false }
 prost = "0.13"
+# Pure-Rust protobuf compiler: replaces the system protoc that prost-build
+# would otherwise require, so hermetic Konflux builds need no protoc artifact
+protox = "0.8"
 rustls = { version = "0.23.46", default-features = false }
 rustls-native-certs = "0.8.3"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }

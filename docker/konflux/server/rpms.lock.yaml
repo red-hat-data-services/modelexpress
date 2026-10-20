@@ -60,13 +60,13 @@ arches:
     name: efi-srpm-macros
     evr: 6-4.el9
     sourcerpm: efi-rpm-macros-6-4.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/e/emacs-filesystem-27.2-18.el9_8.2.noarch.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/e/emacs-filesystem-27.2-18.el9_8.3.noarch.rpm
     repoid: ubi-9-for-aarch64-appstream-rpms
-    size: 14714
-    checksum: sha256:9fa83444f3dcc5a0e59220b864b39aa2eaccf084cf3190e03ba15cf03da3102a
+    size: 14873
+    checksum: sha256:1639502a970d4c49a7f3f8e56009f49a3476644d21719472c83b50d05784178e
     name: emacs-filesystem
-    evr: 1:27.2-18.el9_8.2
-    sourcerpm: emacs-27.2-18.el9_8.2.src.rpm
+    evr: 1:27.2-18.el9_8.3
+    sourcerpm: emacs-27.2-18.el9_8.3.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/f/fonts-srpm-macros-2.0.5-7.el9.1.noarch.rpm
     repoid: ubi-9-for-aarch64-appstream-rpms
     size: 30140
@@ -2727,13 +2727,6 @@ arches:
     name: systemd-libs
     evr: 252-67.el9_8.6
     sourcerpm: systemd-252-67.el9_8.6.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/t/tar-1.34-13.el9_8.aarch64.rpm
-    repoid: ubi-9-for-aarch64-baseos-rpms
-    size: 909271
-    checksum: sha256:ee4fa57c4bb87613f6fbd4b785a9e6162d43f046d1bbdd5022771652b931e9d0
-    name: tar
-    evr: 2:1.34-13.el9_8
-    sourcerpm: tar-1.34-13.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/t/tzdata-2026e-1.el9_8.noarch.rpm
     repoid: ubi-9-for-aarch64-baseos-rpms
     size: 936099
@@ -2769,13 +2762,6 @@ arches:
     name: vim-filesystem
     evr: 2:8.2.2637-26.el9_8.23
     sourcerpm: vim-8.2.2637-26.el9_8.23.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/x/xz-5.2.5-8.el9_0.aarch64.rpm
-    repoid: ubi-9-for-aarch64-baseos-rpms
-    size: 235798
-    checksum: sha256:26ac21be6c1e396c7bcbaa9d4786e3275e996d9d78c01f75bbbc6962e6c9bef7
-    name: xz
-    evr: 5.2.5-8.el9_0
-    sourcerpm: xz-5.2.5-8.el9_0.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/x/xz-libs-5.2.5-8.el9_0.aarch64.rpm
     repoid: ubi-9-for-aarch64-baseos-rpms
     size: 94569
@@ -4208,13 +4194,13 @@ arches:
     name: perl-Time-Piece
     evr: 1.3401-484.el9_8
     sourcerpm: perl-5.32.1-484.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/p/perl-URI-5.09-3.el9.noarch.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/p/perl-URI-5.09-3.el9_8.1.noarch.rpm
     repoid: ubi-9-for-x86_64-appstream-rpms
-    size: 128279
-    checksum: sha256:1635b7d818e4f70445f7207f13e058c63c5d1f5aa081cfd2583912ae45f8e1bd
+    size: 130351
+    checksum: sha256:5dc2921a96c8dac9acbb3b2c36a45cf71c6c9bc81b12b01d08488692f7ff5bad
     name: perl-URI
-    evr: 5.09-3.el9
-    sourcerpm: perl-URI-5.09-3.el9.src.rpm
+    evr: 5.09-3.el9_8.1
+    sourcerpm: perl-URI-5.09-3.el9_8.1.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/p/perl-Unicode-Collate-1.29-4.el9.x86_64.rpm
     repoid: ubi-9-for-x86_64-appstream-rpms
     size: 782467
@@ -5510,13 +5496,6 @@ arches:
     name: systemd-libs
     evr: 252-67.el9_8.6
     sourcerpm: systemd-252-67.el9_8.6.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/t/tar-1.34-13.el9_8.x86_64.rpm
-    repoid: ubi-9-for-x86_64-baseos-rpms
-    size: 914200
-    checksum: sha256:913d84cd94463e3f0400d80c6742a2974eeab6445ac71ff9eb802a70779c146f
-    name: tar
-    evr: 2:1.34-13.el9_8
-    sourcerpm: tar-1.34-13.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/t/tzdata-2026e-1.el9_8.noarch.rpm
     repoid: ubi-9-for-x86_64-baseos-rpms
     size: 936099
@@ -5552,13 +5531,6 @@ arches:
     name: vim-filesystem
     evr: 2:8.2.2637-26.el9_8.23
     sourcerpm: vim-8.2.2637-26.el9_8.23.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/x/xz-5.2.5-8.el9_0.x86_64.rpm
-    repoid: ubi-9-for-x86_64-baseos-rpms
-    size: 235693
-    checksum: sha256:f16d17c26a241400586ddc3d734ce863e3f19d433881ec640a47bedf0dafd07b
-    name: xz
-    evr: 5.2.5-8.el9_0
-    sourcerpm: xz-5.2.5-8.el9_0.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/x/xz-libs-5.2.5-8.el9_0.x86_64.rpm
     repoid: ubi-9-for-x86_64-baseos-rpms
     size: 96649

@@ -19,8 +19,6 @@ packages:
   - gcc
   - binutils
   - openssl-devel
-  - tar
-  - xz
   # runtime
   - ca-certificates
   - openssl-libs

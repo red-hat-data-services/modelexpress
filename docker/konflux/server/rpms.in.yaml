@@ -23,9 +23,6 @@ packages:
   - perl
   - openssl-devel
   - git-core
-  - unzip
-  - tar
-  - xz
   # runtime
   - ca-certificates
   - openssl-libs

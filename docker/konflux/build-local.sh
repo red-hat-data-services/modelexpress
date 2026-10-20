@@ -69,8 +69,7 @@ build_image() {
     mkdir -p "${output}"
     hermeto fetch-deps --source /source --output "/output/${image}" "[
         {\"type\": \"cargo\", \"path\": \".\"},
-        {\"type\": \"rpm\", \"path\": \"${konflux_dir}\"},
-        {\"type\": \"generic\", \"path\": \"${konflux_dir}\", \"lockfile\": \"generic-fetcher.yaml\"}
+        {\"type\": \"rpm\", \"path\": \"${konflux_dir}\"}
     ]"
     hermeto inject-files "/output/${image}" --for-output-dir /cachi2/output
     hermeto generate-env "/output/${image}" --format env \

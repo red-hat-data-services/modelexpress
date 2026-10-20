@@ -66,6 +66,7 @@ google-cloud-gax = { workspace = true }
 wiremock = "0.6.5"
 
 [build-dependencies]
+protox = { workspace = true }
 tonic-build = { workspace = true }
 
 [lints]
