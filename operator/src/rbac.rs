@@ -9,6 +9,7 @@
 //! ci/k8s/server/rbac-modelmetadata.yaml.
 
 use crate::crd::{AuthMode, MetadataBackend, ModelExpressServerSpec};
+use crate::digest::DigestError;
 use crate::labels::managed_labels;
 use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::api::rbac::v1::{
@@ -39,17 +40,19 @@ pub fn role_name(cr_name: &str) -> String {
 /// they may both contain is ambiguous (team-a/mx and team/a-mx read alike),
 /// and either can be long enough to overrun a name, so the readable part is
 /// truncated and a digest of the pair decides the name.
-pub fn auth_delegator_binding_name(cr_name: &str, ns: &str) -> String {
+pub fn auth_delegator_binding_name(cr_name: &str, ns: &str) -> Result<String, DigestError> {
     /// Leaves room for the suffix inside the 253 a name allows.
     const READABLE: usize = 100;
     const DIGEST: usize = 16;
 
-    let digest = crate::digest::hex(&crate::digest::sha256(format!("{ns}/{cr_name}").as_bytes()));
+    let digest = crate::digest::hex(&crate::digest::sha256(
+        format!("{ns}/{cr_name}").as_bytes(),
+    )?);
     let mut readable = format!("modelexpress-{ns}-{cr_name}");
     readable.truncate(READABLE);
     let readable = readable.trim_end_matches('-');
     let digest = digest.get(..DIGEST).unwrap_or(digest.as_str());
-    format!("{readable}-auth-delegator-{digest}")
+    Ok(format!("{readable}-auth-delegator-{digest}"))
 }
 
 /// Enforce mode validates client tokens with TokenReview, which is a
@@ -60,13 +63,13 @@ pub fn render_auth_delegator_binding(
     cr_name: &str,
     ns: &str,
     spec: &ModelExpressServerSpec,
-) -> Option<ClusterRoleBinding> {
+) -> Result<Option<ClusterRoleBinding>, DigestError> {
     if spec.security.as_ref().map(|s| s.mode) != Some(AuthMode::Enforce) {
-        return None;
+        return Ok(None);
     }
-    Some(ClusterRoleBinding {
+    Ok(Some(ClusterRoleBinding {
         metadata: ObjectMeta {
-            name: Some(auth_delegator_binding_name(cr_name, ns)),
+            name: Some(auth_delegator_binding_name(cr_name, ns)?),
             labels: Some(managed_labels(cr_name)),
             ..ObjectMeta::default()
         },
@@ -81,7 +84,7 @@ pub fn render_auth_delegator_binding(
             namespace: Some(ns.to_string()),
             ..Subject::default()
         }]),
-    })
+    }))
 }
 
 pub struct ServerRbac {
@@ -216,19 +219,19 @@ mod tests {
     #[test]
     fn binding_names_cannot_collide_across_namespaces() {
         assert_ne!(
-            auth_delegator_binding_name("mx", "team-a"),
-            auth_delegator_binding_name("a-mx", "team")
+            auth_delegator_binding_name("mx", "team-a").expect("name"),
+            auth_delegator_binding_name("a-mx", "team").expect("name")
         );
         assert_eq!(
-            auth_delegator_binding_name("mx", "team-a"),
-            auth_delegator_binding_name("mx", "team-a"),
+            auth_delegator_binding_name("mx", "team-a").expect("name"),
+            auth_delegator_binding_name("mx", "team-a").expect("name"),
             "the name has to be stable for the same CR"
         );
     }
 
     #[test]
     fn binding_names_stay_within_a_kubernetes_name() {
-        let name = auth_delegator_binding_name(&"c".repeat(253), &"n".repeat(63));
+        let name = auth_delegator_binding_name(&"c".repeat(253), &"n".repeat(63)).expect("name");
         assert!(name.len() <= 253, "{} chars", name.len());
         assert!(
             name.chars()
@@ -347,10 +350,16 @@ mod tests {
             allowed_service_accounts: vec![],
             cache_ttl_secs: None,
         });
-        let binding = render_auth_delegator_binding("mx", "mx-system", &spec).expect("binding");
+        let binding = render_auth_delegator_binding("mx", "mx-system", &spec)
+            .expect("sha256")
+            .expect("binding");
         assert_eq!(
             binding.metadata.name.as_deref(),
-            Some(auth_delegator_binding_name("mx", "mx-system").as_str())
+            Some(
+                auth_delegator_binding_name("mx", "mx-system")
+                    .expect("name")
+                    .as_str()
+            )
         );
         assert_eq!(binding.role_ref.kind, "ClusterRole");
         assert_eq!(binding.role_ref.name, AUTH_DELEGATOR_CLUSTER_ROLE);
@@ -373,28 +382,38 @@ mod tests {
             allowed_service_accounts: vec![],
             cache_ttl_secs: None,
         });
-        let binding = render_auth_delegator_binding("mx", "mx-system", &spec).expect("binding");
+        let binding = render_auth_delegator_binding("mx", "mx-system", &spec)
+            .expect("sha256")
+            .expect("binding");
         assert_eq!(binding.subjects.expect("subjects")[0].name, "my-sa");
     }
 
     #[test]
     fn non_enforce_modes_get_no_cluster_binding() {
         let mut spec = spec(MetadataBackend::Kubernetes {}, None);
-        assert!(render_auth_delegator_binding("mx", "mx-system", &spec).is_none());
+        assert!(
+            render_auth_delegator_binding("mx", "mx-system", &spec)
+                .expect("sha256")
+                .is_none()
+        );
         spec.security = Some(SecurityConfig {
             mode: AuthMode::Disabled,
             token_audiences: vec![],
             allowed_service_accounts: vec![],
             cache_ttl_secs: None,
         });
-        assert!(render_auth_delegator_binding("mx", "mx-system", &spec).is_none());
+        assert!(
+            render_auth_delegator_binding("mx", "mx-system", &spec)
+                .expect("sha256")
+                .is_none()
+        );
     }
 
     #[test]
     fn binding_names_are_unique_per_namespace() {
         assert_ne!(
-            auth_delegator_binding_name("mx", "team-a"),
-            auth_delegator_binding_name("mx", "team-b")
+            auth_delegator_binding_name("mx", "team-a").expect("name"),
+            auth_delegator_binding_name("mx", "team-b").expect("name")
         );
     }
 

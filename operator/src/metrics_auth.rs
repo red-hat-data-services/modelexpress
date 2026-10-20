@@ -6,6 +6,7 @@
 //! `get` on the `/metrics` non-resource URL. The same gate
 //! controller-runtime's `WithAuthenticationAndAuthorization` filter applies.
 
+use crate::digest::DigestError;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
@@ -32,7 +33,7 @@ pub const MAX_DECISIONS: u64 = 1024;
 
 /// SHA-256 of the bearer token, the cache key, so tokens are not held in
 /// memory.
-fn token_key(token: &str) -> [u8; 32] {
+fn token_key(token: &str) -> Result<[u8; 32], DigestError> {
     crate::digest::sha256(token.as_bytes())
 }
 
@@ -48,6 +49,8 @@ pub enum AuthError {
     Unauthenticated,
     #[error("caller may not get {METRICS_PATH}")]
     Forbidden,
+    #[error(transparent)]
+    Digest(#[from] DigestError),
 }
 
 impl AuthError {
@@ -56,6 +59,7 @@ impl AuthError {
             Self::NoToken | Self::Unauthenticated => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Review(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Digest(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -94,7 +98,7 @@ impl MetricsAuth {
 
     /// Decide for a bearer token, consulting the cache first.
     pub async fn authorize(&self, token: &str) -> Result<(), AuthError> {
-        let key = token_key(token);
+        let key = token_key(token)?;
         if let Some(decision) = self.cache.get(&key).await {
             return decision.map_err(|denied| match denied {
                 Denied::Unauthenticated => AuthError::Unauthenticated,

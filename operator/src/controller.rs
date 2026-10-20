@@ -5,6 +5,7 @@
 
 use crate::crd::{CacheStorage, ModelExpressServer, ModelExpressServerStatus};
 use crate::deployment::{DesiredState, render};
+use crate::digest::DigestError;
 use crate::labels;
 use crate::rbac::{
     ServerRbac, auth_delegator_binding_name, render_auth_delegator_binding, render_rbac, role_name,
@@ -58,6 +59,8 @@ pub enum Error {
         modes: Vec<String>,
         replicas: i32,
     },
+    #[error(transparent)]
+    Digest(#[from] DigestError),
 }
 
 pub struct Ctx {
@@ -332,8 +335,8 @@ async fn apply_auth_delegator(
     params: &PatchParams,
 ) -> Result<(), Error> {
     let api = Api::<ClusterRoleBinding>::all(ctx.client.clone());
-    let binding_name = auth_delegator_binding_name(name, ns);
-    match render_auth_delegator_binding(name, ns, &cr.spec) {
+    let binding_name = auth_delegator_binding_name(name, ns)?;
+    match render_auth_delegator_binding(name, ns, &cr.spec)? {
         Some(binding) => {
             set_finalizer(cr, ns, name, ctx, true).await?;
             api.patch(&binding_name, params, &Patch::Apply(&binding))
@@ -357,7 +360,7 @@ async fn release_auth_delegator(
     ctx: &Ctx,
 ) -> Result<(), Error> {
     let api = Api::<ClusterRoleBinding>::all(ctx.client.clone());
-    delete_if_managed(&api, &auth_delegator_binding_name(name, ns), name).await?;
+    delete_if_managed(&api, &auth_delegator_binding_name(name, ns)?, name).await?;
     set_finalizer(cr, ns, name, ctx, false).await
 }
 
@@ -515,6 +518,7 @@ fn reason(err: &Error) -> &'static str {
         Error::MissingUid => "MissingUid",
         Error::MissingClaim { .. } => "CacheClaimMissing",
         Error::SingleNodeClaim { .. } => "CacheClaimSingleNode",
+        Error::Digest(_) => "DigestFailed",
     }
 }
 

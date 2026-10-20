@@ -8,8 +8,9 @@
 #
 # Reads the symbol table of the binary itself, so it sees exactly what was
 # linked regardless of how cargo resolved features. If the binary carries
-# cargo-auditable data, that must not list the banned crates either. The
-# Konflux Dockerfiles run it on the binary they ship.
+# cargo-auditable data, its runtime crates must not include check-payload's
+# rust_denied_crypto list (pure-Rust primitives like sha2 leave no symbols).
+# The Konflux Dockerfiles run it on the binary they ship.
 #
 # Usage: ci/check-fips-crypto.sh <binary>...
 
@@ -63,10 +64,23 @@ for bin in "$@"; do
         rm -f "${copy}"
         stamped=$(python3 - "${section}" <<'EOF'
 import json, sys, zlib
-banned = {"ring", "rustls", "aws-lc-rs", "aws-lc-sys"}
+# Mirrors openshift/check-payload rust_denied_crypto, plus rustls. Like
+# check-payload, build and dev deps only count for crates that bundle C crypto.
+banned = {
+    "rustls", "ring", "aws-lc-rs", "aws-lc-sys", "aws-lc-fips-sys",
+    "boring", "boring-sys", "openssl-src",
+    "sha1", "sha2", "sha3", "md-5", "hmac", "aes", "aes-gcm",
+    "chacha20poly1305", "ctr", "cbc", "rsa", "ecdsa",
+    "ed25519-dalek", "curve25519-dalek", "x25519-dalek", "p256", "p384",
+}
+native = {"openssl-src", "aws-lc-sys", "aws-lc-fips-sys", "boring-sys"}
 with open(sys.argv[1], "rb") as f:
     packages = json.loads(zlib.decompress(f.read()))["packages"]
-print(" ".join(sorted({p["name"] for p in packages} & banned)))
+linked = {
+    p["name"] for p in packages
+    if p["name"] in native or p.get("kind", "runtime") == "runtime"
+}
+print(" ".join(sorted(linked & banned)))
 EOF
 )
         rm -f "${section}"
@@ -74,7 +88,7 @@ EOF
             echo "    FAIL: cargo-auditable data lists ${stamped}; build with -Z sbom"
             failed=1
         else
-            echo "    ok: cargo-auditable data lists no ring, rustls or aws-lc"
+            echo "    ok: cargo-auditable data lists no denied crypto crates"
         fi
     fi
 done
