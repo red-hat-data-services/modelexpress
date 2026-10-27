@@ -10,7 +10,7 @@
 # Hermetic: every input is prefetched by Hermeto (cargo, rpm) per
 # docker/konflux/operator/. Local build: ./docker/konflux/build-local.sh operator
 
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:217dd5692d369799d34d09ffb6f5f3404efebc7900834490fdf9ae92fd6721d4 AS build
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:48393e4261b2544f652c915b3e052256ddf66ee95cd04dc0362191f302c4e94a AS build
 
 # openssl-devel: FIPS builds link RHEL's openssl (ci/check-fips-crypto.sh)
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
