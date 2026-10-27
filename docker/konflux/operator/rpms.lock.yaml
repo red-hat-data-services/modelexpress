@@ -32,13 +32,13 @@ arches:
     name: glibc-devel
     evr: 2.34-283.el9_8
     sourcerpm: glibc-2.34-283.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/k/kernel-headers-5.14.0-687.60.1.el9_8.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/k/kernel-headers-5.14.0-687.61.1.el9_8.aarch64.rpm
     repoid: ubi-9-for-aarch64-appstream-rpms
-    size: 2947321
-    checksum: sha256:2905722b8f11583753d46f31afa2fdfe14784bcbb8d6668eb5a4ee1d7ff63752
+    size: 2955061
+    checksum: sha256:40ddd229d41cbb7f645a1c1b152e5af87b1ef9c1fb96aecc2373c95a2dbc8ca2
     name: kernel-headers
-    evr: 5.14.0-687.60.1.el9_8
-    sourcerpm: kernel-5.14.0-687.60.1.el9_8.src.rpm
+    evr: 5.14.0-687.61.1.el9_8
+    sourcerpm: kernel-5.14.0-687.61.1.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/l/libasan-11.5.0-14.el9.aarch64.rpm
     repoid: ubi-9-for-aarch64-appstream-rpms
     size: 409047
@@ -326,13 +326,13 @@ arches:
     name: libattr
     evr: 2.6.0-1.el9_8
     sourcerpm: attr-2.6.0-1.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libbrotli-1.0.9-10.el9_8.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libbrotli-1.0.9-10.el9_8.1.aarch64.rpm
     repoid: ubi-9-for-aarch64-baseos-rpms
-    size: 325419
-    checksum: sha256:04d157b138153dcd27c04d81ae985e8190ddc542d63620f3d1ae0a690a1041b7
+    size: 325599
+    checksum: sha256:f1b700ba7bfa1bb8d0b0f8af47c9a5afd8a44c74cec4ef17627b268c518c358b
     name: libbrotli
-    evr: 1.0.9-10.el9_8
-    sourcerpm: brotli-1.0.9-10.el9_8.src.rpm
+    evr: 1.0.9-10.el9_8.1
+    sourcerpm: brotli-1.0.9-10.el9_8.1.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libcap-2.48-10.el9_8.1.aarch64.rpm
     repoid: ubi-9-for-aarch64-baseos-rpms
     size: 78021
@@ -676,13 +676,13 @@ arches:
     name: tzdata
     evr: 2026e-1.el9_8
     sourcerpm: tzdata-2026e-1.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/x/xz-libs-5.2.5-8.el9_0.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/x/xz-libs-5.2.5-8.el9_8.1.aarch64.rpm
     repoid: ubi-9-for-aarch64-baseos-rpms
-    size: 94569
-    checksum: sha256:06931afb372ed4a6893e51558beaa6b0eab7adda0af93456fd99a081a8b80779
+    size: 97519
+    checksum: sha256:676d05687218716506c26203552a5a4537e72c20928b03d5c245301feb936e5f
     name: xz-libs
-    evr: 5.2.5-8.el9_0
-    sourcerpm: xz-5.2.5-8.el9_0.src.rpm
+    evr: 5.2.5-8.el9_8.1
+    sourcerpm: xz-5.2.5-8.el9_8.1.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/z/zlib-1.2.11-40.el9.aarch64.rpm
     repoid: ubi-9-for-aarch64-baseos-rpms
     size: 94454
@@ -729,13 +729,13 @@ arches:
     name: glibc-headers
     evr: 2.34-283.el9_8
     sourcerpm: glibc-2.34-283.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/k/kernel-headers-5.14.0-687.60.1.el9_8.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/k/kernel-headers-5.14.0-687.61.1.el9_8.x86_64.rpm
     repoid: ubi-9-for-x86_64-appstream-rpms
-    size: 2986597
-    checksum: sha256:02a07e8ee63bd1d2ed34b2bb5c7bd114860b0422832af1a5cc305dfdc2bc46f7
+    size: 2994353
+    checksum: sha256:e033c43830512e57b795bb85c0bfdc5a250cde81cb72c2205998643617c27885
     name: kernel-headers
-    evr: 5.14.0-687.60.1.el9_8
-    sourcerpm: kernel-5.14.0-687.60.1.el9_8.src.rpm
+    evr: 5.14.0-687.61.1.el9_8
+    sourcerpm: kernel-5.14.0-687.61.1.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/l/libmpc-1.2.1-4.el9.x86_64.rpm
     repoid: ubi-9-for-x86_64-appstream-rpms
     size: 66075
@@ -1002,13 +1002,13 @@ arches:
     name: libattr
     evr: 2.6.0-1.el9_8
     sourcerpm: attr-2.6.0-1.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libbrotli-1.0.9-10.el9_8.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libbrotli-1.0.9-10.el9_8.1.x86_64.rpm
     repoid: ubi-9-for-x86_64-baseos-rpms
-    size: 326501
-    checksum: sha256:ecf2cda794cb9f68a7f67742ce0aeef4c3480795cce0e9bc8f49634072fd2e07
+    size: 326567
+    checksum: sha256:4ac44eaf3518e46780b8f449fa68f762e4fe8b88d0de7845d7fe8399d829d966
     name: libbrotli
-    evr: 1.0.9-10.el9_8
-    sourcerpm: brotli-1.0.9-10.el9_8.src.rpm
+    evr: 1.0.9-10.el9_8.1
+    sourcerpm: brotli-1.0.9-10.el9_8.1.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libcap-2.48-10.el9_8.1.x86_64.rpm
     repoid: ubi-9-for-x86_64-baseos-rpms
     size: 78928
@@ -1352,13 +1352,13 @@ arches:
     name: tzdata
     evr: 2026e-1.el9_8
     sourcerpm: tzdata-2026e-1.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/x/xz-libs-5.2.5-8.el9_0.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/x/xz-libs-5.2.5-8.el9_8.1.x86_64.rpm
     repoid: ubi-9-for-x86_64-baseos-rpms
-    size: 96649
-    checksum: sha256:de263f880a4394f04b5e84254ba0a88d781b5bd63665c9e028bc10351490c982
+    size: 99498
+    checksum: sha256:0a0aed732d24942475761b6094842dd58c2eecf396f96556a1bdde0f890c97f9
     name: xz-libs
-    evr: 5.2.5-8.el9_0
-    sourcerpm: xz-5.2.5-8.el9_0.src.rpm
+    evr: 5.2.5-8.el9_8.1
+    sourcerpm: xz-5.2.5-8.el9_8.1.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/z/zlib-1.2.11-40.el9.x86_64.rpm
     repoid: ubi-9-for-x86_64-baseos-rpms
     size: 95708
