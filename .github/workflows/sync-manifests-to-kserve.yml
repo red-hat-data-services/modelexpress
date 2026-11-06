@@ -1,0 +1,100 @@
+name: Sync Manifests to kserve
+
+on:
+  pull_request_target:
+    branches:
+      - 'rhoai-[0-9].[0-9]**'
+    types: [closed]
+    paths: ['config/manifests/**', '.github/workflows/sync-manifests-to-kserve.yml']
+  push:
+    branches: [main]
+    paths: ['config/manifests/**', '.github/workflows/sync-manifests-to-kserve.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.merged == true
+    name: Sync kustomize manifests to kserve
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: ${{ github.event_name == 'pull_request_target' && github.base_ref || github.ref_name }}
+    steps:
+      - name: Print sync parameters
+        run: |
+          echo "Source: ${{ github.repository }} @ ${{ env.TARGET_BRANCH }}"
+          echo "Target: ${{ github.repository_owner }}/kserve @ ${{ env.TARGET_BRANCH }}"
+
+      - name: Checkout modelexpress
+        id: checkout-source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          path: modelexpress
+
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RHDS_CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RHDS_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: kserve
+
+      - name: Checkout kserve
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/kserve
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: kserve
+
+      - name: Sync manifests
+        run: |
+          DEST="kserve/kserve-module/prefetched-manifests-rhoai/modelexpress"
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+          cp -r modelexpress/config/manifests/. "$DEST/"
+
+      - name: Detect changes
+        id: changes
+        working-directory: kserve
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No manifest changes detected — skipping PR creation."
+          fi
+
+      - name: Push updated manifests to KServe
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          SOURCE_BRANCH: ${{ env.TARGET_BRANCH }}
+          SOURCE_SHA: ${{ steps.checkout-source.outputs.commit }}
+        working-directory: kserve
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all kserve-module/prefetched-manifests-rhoai/modelexpress/
+          git commit -m "chore: sync modelexpress manifests from ${REPO_OWNER}/modelexpress@${SOURCE_SHA:0:8}"
+          MAX_RETRIES=5
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            if git push origin "$SOURCE_BRANCH"; then
+              echo "Push of updated manifests succeeded (attempt ${attempt})"
+              exit 0
+            fi
+            echo "Push of updated manifests failed (attempt ${attempt})"
+            if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+              echo "Rebasing and retrying"
+              if ! git pull --rebase origin "$SOURCE_BRANCH"; then
+                echo "ERROR: Rebase failed. Aborting." >&2
+                exit 1
+              fi
+            fi
+          done
+          echo "ERROR: All retries exhausted. Push failed." >&2
+          exit 1
