@@ -14,7 +14,7 @@
 # feature along with rustls, so this image cannot pull models from GCS:
 # google-cloud-auth hardcodes rustls. HuggingFace and NGC are unaffected.
 
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:87f66688da4e206d5a1877088626c542288a5ccd97898cf363b588d57817e6be AS build
+FROM registry.access.redhat.com/ubi9/ubi:9.9@sha256:e45746866f611d164042b961cd83f1093c4fdb422d9b99fcf23ff951626044f8 AS build
 
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
         rust cargo cmake gcc gcc-c++ binutils perl \
@@ -32,7 +32,7 @@ RUN cargo build --release --locked --package modelexpress-server --bin modelexpr
     && ci/check-fips-crypto.sh target/release/modelexpress-server \
     && cp target/release/modelexpress-server /modelexpress-server
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.8-1791946957@sha256:b3a0b012de0c578082e1bc5b01c8bc27461b4eeb571a0b1a2b21a07dbd845a62
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.9-1794497468@sha256:9aca95ae4e261eab848dc6abdfd08eb4c2453944232021245b2e3108eb25ae18
 
 RUN microdnf install -y --nodocs ca-certificates openssl-libs \
     && microdnf clean all
