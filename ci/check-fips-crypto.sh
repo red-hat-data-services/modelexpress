@@ -23,7 +23,11 @@ fi
 
 # Rust paths (ring::, rustls::, ...) and the prefixed C symbols ring and
 # aws-lc build with. \b keeps string:: from matching ring::.
-BANNED='\b(ring|rustls|aws_lc_rs|aws_lc_sys)::|\bring_core_[0-9]|\baws_lc_[0-9]'
+# rustc >= 1.97 mangles with v0 by default and el9's binutils (2.35, v0
+# support only from 2.40) cannot demangle it, so the raw v0 crate-root
+# segments (Cs<disambiguator>_<length><name>) are matched too; no trailing
+# \b there, the next identifier follows immediately.
+BANNED='\b(ring|rustls|aws_lc_rs|aws_lc_sys)::|\bring_core_[0-9]|\baws_lc_[0-9]|Cs[0-9A-Za-z]+_(4ring|6rustls|9aws_lc_rs|10aws_lc_sys)'
 
 failed=0
 for bin in "$@"; do
@@ -50,7 +54,7 @@ for bin in "$@"; do
         echo "    ok: no ring, rustls or aws-lc symbols"
     fi
 
-    if grep -qE '\bopenssl::' <<<"${symbols}"; then
+    if grep -qE '\bopenssl::|Cs[0-9A-Za-z]+_7openssl' <<<"${symbols}"; then
         echo "    ok: openssl linked"
     else
         echo "    FAIL: no openssl symbols; the openssl feature did not apply"
