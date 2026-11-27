@@ -13,7 +13,8 @@
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{
-    ArtifactSourceMetadata, SourceIdentity, SourceStatus, TensorSourceMetadata, WorkerMetadata,
+    ArtifactSourceMetadata, SourceIdentity, SourceStatus, TensorMemoryType, TensorSourceMetadata,
+    WorkerMetadata,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -88,6 +89,12 @@ pub(crate) fn parse_training_step(extra_parameters: &HashMap<String, String>) ->
         .get("training_step")
         .or_else(|| extra_parameters.get("version"))
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+/// Stored tensor records omit the VRAM default, so they match records written
+/// before `mem_type` existed.
+pub(crate) fn is_vram_mem_type(mem_type: &i32) -> bool {
+    *mem_type == TensorMemoryType::Vram as i32
 }
 
 pub(crate) fn parse_layout_signature(extra_parameters: &HashMap<String, String>) -> Option<String> {
@@ -186,6 +193,8 @@ pub struct TensorRecord {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    /// Memory type of addr (maps to `TensorMemoryType` proto enum)
+    pub mem_type: i32,
 }
 
 /// Bounded artifact discovery summary stored with worker metadata.
@@ -245,6 +254,7 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
             size: desc.size,
             device_id: desc.device_id,
             dtype: desc.dtype,
+            mem_type: desc.mem_type,
         }
     }
 }
@@ -303,6 +313,7 @@ impl From<TensorRecord> for modelexpress_common::grpc::p2p::TensorDescriptor {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            mem_type: record.mem_type,
         }
     }
 }
@@ -338,6 +349,35 @@ impl From<ArtifactSourceMetadataRecord> for ArtifactSourceMetadata {
 pub trait MetadataBackend: Send + Sync {
     /// Connect to the backend (initialize connections, etc.)
     async fn connect(&self) -> MetadataResult<()>;
+
+    /// Attempt to acquire an opt-in cold-start donor lease.
+    async fn try_acquire_donor_lease(
+        &self,
+        _compatibility_key: &str,
+        _owner_token: &str,
+        _duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        Err("donor leases are not supported by this metadata backend".into())
+    }
+
+    /// Renew an owned cold-start donor lease.
+    async fn renew_donor_lease(
+        &self,
+        _compatibility_key: &str,
+        _owner_token: &str,
+        _duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        Err("donor leases are not supported by this metadata backend".into())
+    }
+
+    /// Release an owned cold-start donor lease.
+    async fn release_donor_lease(
+        &self,
+        _compatibility_key: &str,
+        _owner_token: &str,
+    ) -> MetadataResult<bool> {
+        Err("donor leases are not supported by this metadata backend".into())
+    }
 
     /// Publish metadata for a source worker.
     /// `worker_id` uniquely identifies this running pod/process among all replicas
@@ -451,6 +491,29 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
 mod tests {
     use super::{parse_layout_signature, parse_training_step};
     use std::collections::HashMap;
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn memory_backend_rejects_donor_leases() {
+        use super::{MetadataBackend, memory::InMemoryMetadataBackend};
+        use std::time::Duration;
+
+        let backend = InMemoryMetadataBackend::new();
+        let ttl = Duration::from_secs(10);
+        let errors = [
+            backend.try_acquire_donor_lease("key", "owner", ttl).await,
+            backend.renew_donor_lease("key", "owner", ttl).await,
+            backend.release_donor_lease("key", "owner").await,
+        ];
+        for result in errors {
+            assert!(matches!(
+                result,
+                Err(error) if error.to_string().contains(
+                    "donor leases are not supported by this metadata backend"
+                )
+            ));
+        }
+    }
 
     #[test]
     fn parses_training_step_with_version_fallback() {

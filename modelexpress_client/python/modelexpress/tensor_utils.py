@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from typing import cast
 
@@ -25,6 +25,10 @@ def _resolve_accelerator_backend(
     return accelerator_backend or CudaAcceleratorBackend()
 
 
+# Bounds the int64 scratch per chunk to 8x this many bytes.
+_CHECKSUM_CHUNK_BYTES = 16 * 1024 * 1024
+
+
 def safe_checksum(tensor: torch.Tensor) -> str:
     """Compute a fast fingerprint of tensor contents, staying on GPU when possible.
 
@@ -36,11 +40,17 @@ def safe_checksum(tensor: torch.Tensor) -> str:
         t = tensor.detach().contiguous()
         if t.dim() == 0:
             t = t.unsqueeze(0)
-        flat = t.view(torch.uint8)
-        idx = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
-        weights = (idx * 2654435761 + 1) & 0xFFFFFFFF
-        mixed = (flat.to(torch.int64) * weights) & 0xFFFFFFFF
-        return format(mixed.sum().item() & 0xFFFFFFFF, "08x")
+        flat = t.reshape(-1).view(torch.uint8)
+        total = torch.zeros((), device=flat.device, dtype=torch.int64)
+        for start in range(0, flat.numel(), _CHECKSUM_CHUNK_BYTES):
+            chunk = flat[start:start + _CHECKSUM_CHUNK_BYTES]
+            idx = torch.arange(
+                start, start + chunk.numel(), device=flat.device, dtype=torch.int64
+            )
+            weights = (idx * 2654435761 + 1) & 0xFFFFFFFF
+            mixed = (chunk.to(torch.int64) * weights) & 0xFFFFFFFF
+            total = (total + mixed.sum()) & 0xFFFFFFFF
+        return format(total.item(), "08x")
     except Exception as e:
         return f"err:{e}"
 
@@ -298,9 +308,38 @@ def adopt_hidden_tensors(
     return adopted
 
 
+def adopt_bare_tensors(
+    model: nn.Module,
+    accelerator_backend: AcceleratorBackend | None = None,
+) -> int:
+    """Promote bare accelerator tensor attributes to non-persistent buffers.
+
+    What capture_tensor_attrs would have done had this process run the
+    post-load processing: a model another loader loaded keeps its W_UV-style
+    tensors as plain attributes, which discover_tensors would otherwise miss.
+    """
+    backend = _resolve_accelerator_backend(accelerator_backend)
+    adopted = 0
+    for _, module in model.named_modules():
+        for name, value in list(vars(module).items()):
+            if (
+                name in _NEVER_ADOPTED_ATTRS
+                or not isinstance(value, torch.Tensor)
+                or isinstance(value, nn.Parameter)
+                or not backend.is_accel_tensor(value)
+            ):
+                continue
+            delattr(module, name)
+            module.register_buffer(name, value, persistent=False)
+            adopted += 1
+    return adopted
+
+
 def iter_module_tensors(
     module: nn.Module,
     accelerator_backend: AcceleratorBackend | None = None,
+    *,
+    include_host_parameters: bool = False,
 ) -> list[tuple[str, torch.Tensor, str]]:
     """Iterate over all accelerator tensors in a module tree.
 
@@ -308,6 +347,10 @@ def iter_module_tensors(
     When used with capture_tensor_attrs() wrapping process_weights_after_loading,
     bare tensor attributes (e.g. W_UV, W_UK_T) are auto-promoted to
     non-persistent buffers and thus included in named_buffers().
+
+    With ``include_host_parameters``, parameters in host memory are included
+    too (e.g. DeepSeek V4.1 Engram tables in pinned host memory). Host buffers
+    are not, since they tend to be process-local state.
 
     Returns:
         List of (qualified_name, tensor, tensor_type) tuples for each
@@ -317,7 +360,7 @@ def iter_module_tensors(
     results: list[tuple[str, torch.Tensor, str]] = []
 
     for name, param in module.named_parameters():
-        if backend.is_accel_tensor(param):
+        if _discovers_parameter(param, backend, include_host_parameters):
             results.append((name, param, "parameter"))
 
     for name, buf in module.named_buffers():
@@ -325,6 +368,38 @@ def iter_module_tensors(
             results.append((name, buf, "buffer"))
 
     return results
+
+
+def _discovers_parameter(
+    param: torch.Tensor,
+    backend: AcceleratorBackend,
+    include_host_parameters: bool,
+) -> bool:
+    return backend.is_accel_tensor(param) or (
+        include_host_parameters and param.device.type == "cpu"
+    )
+
+
+def undiscovered_parameters(
+    module: nn.Module,
+    accelerator_backend: AcceleratorBackend | None = None,
+    *,
+    include_host_parameters: bool = False,
+) -> list[str]:
+    """Return names of non-empty parameters in memory that tensor discovery
+    does not collect from.
+
+    A target would keep its initial values for these, e.g. DeepSeek V4.1
+    Engram tables in pinned host memory when host parameters are not
+    discovered, or a parameter left on the ``meta`` device.
+    """
+    backend = _resolve_accelerator_backend(accelerator_backend)
+    return [
+        name
+        for name, param in module.named_parameters()
+        if param.numel() > 0
+        and not _discovers_parameter(param, backend, include_host_parameters)
+    ]
 
 
 def storage_view(tensor: torch.Tensor) -> torch.Tensor:
@@ -348,6 +423,9 @@ def storage_view(tensor: torch.Tensor) -> torch.Tensor:
 def collect_module_tensors(
     model: nn.Module,
     accelerator_backend: AcceleratorBackend | None = None,
+    *,
+    preserve_local: Iterable[torch.Tensor] = (),
+    include_host_parameters: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Collect all accelerator tensors from a module tree into a flat dict.
 
@@ -368,18 +446,66 @@ def collect_module_tensors(
 
     Zero-element tensors retain their original names and bypass pointer-based
     deduplication because distinct empty tensors can share a null data_ptr.
+
+    Engine-owned contiguous ``preserve_local`` tensors and buffer aliases fully
+    inside their byte ranges are omitted before deduplication. A parameter or
+    wider transfer overlapping local state is a classification conflict and
+    raises rather than silently dropping required data or overwriting state.
+
+    With ``include_host_parameters``, parameters in host memory are collected
+    too.
     """
     backend = _resolve_accelerator_backend(accelerator_backend)
+    local_ranges: dict[torch.device, set[tuple[int, int]]] = {}
+    for local in preserve_local:
+        if local.numel() == 0 or not _discovers_parameter(
+            local, backend, include_host_parameters
+        ):
+            continue
+        if not local.is_contiguous():
+            raise ValueError("Local runtime tensors must be contiguous")
+        start = local.data_ptr()
+        local_ranges.setdefault(local.device, set()).add(
+            (start, start + local.numel() * local.element_size())
+        )
+
+    def overlaps_local(tensor: torch.Tensor) -> bool:
+        start = tensor.data_ptr()
+        end = start + tensor.numel() * tensor.element_size()
+        return any(
+            start < right and left < end
+            for left, right in local_ranges.get(tensor.device, ())
+        )
+
     tensors: dict[str, torch.Tensor] = {}
     seen_ptrs: set[int] = set()
     storage_view_count = 0
     skipped_duplicate = 0
-    for name, tensor, _tensor_type in iter_module_tensors(model, backend):
+    for name, tensor, tensor_type in iter_module_tensors(
+        model, backend, include_host_parameters=include_host_parameters
+    ):
         t = tensor.data if hasattr(tensor, "data") else tensor
 
         if t.numel() == 0:
             tensors[name] = t
             continue
+
+        ranges = local_ranges.get(t.device, ())
+        if ranges:
+            start = t.data_ptr()
+            span = 1 + sum(
+                (size - 1) * stride for size, stride in zip(t.shape, t.stride())
+            )
+            end = start + span * t.element_size()
+            if any(start < right and left < end for left, right in ranges):
+                if tensor_type == "buffer" and any(
+                    left <= start and end <= right for left, right in ranges
+                ):
+                    logger.debug("Preserving local runtime tensor '%s'", name)
+                    continue
+                raise ValueError(
+                    f"Transfer tensor '{name}' overlaps local runtime state"
+                )
 
         if t.is_contiguous():
             ptr = t.data_ptr()
@@ -391,6 +517,10 @@ def collect_module_tensors(
             tensors[name] = t
         else:
             sv = storage_view(t)
+            if overlaps_local(sv):
+                raise ValueError(
+                    f"Transfer tensor '{name}.__storage' overlaps local runtime state"
+                )
             ptr = sv.data_ptr()
             if ptr in seen_ptrs:
                 skipped_duplicate += 1

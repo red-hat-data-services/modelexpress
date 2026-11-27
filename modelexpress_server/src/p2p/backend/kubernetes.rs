@@ -109,6 +109,7 @@ impl KubernetesBackend {
                 size: t.size.to_string(),
                 device_id: t.device_id,
                 dtype: t.dtype.clone(),
+                mem_type: t.mem_type,
             })
             .collect();
 
@@ -199,6 +200,7 @@ impl KubernetesBackend {
                     size,
                     device_id: t.device_id,
                     dtype: t.dtype,
+                    mem_type: t.mem_type,
                 })
             })
             .collect::<MetadataResult<Vec<_>>>()?;
@@ -929,7 +931,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn worker_status_topology_survives_serde_round_trip() {
         // The k8s backend stores WorkerStatus as CR JSON, so a non-empty
         // topology must survive the round trip. The deployed CRD schema must

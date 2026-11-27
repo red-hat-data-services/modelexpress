@@ -29,6 +29,7 @@ class MockAcceleratorBackend:
     pool_reg: bool = False
     vmm: bool = False
     gds: bool = False
+    classic_alloc_pool: bool = False
     set_device_calls: list[int] = field(default_factory=list)
     synchronize_calls: list[int | None] = field(default_factory=list)
     empty_cache_calls: int = 0
@@ -51,6 +52,15 @@ class MockAcceleratorBackend:
     def is_accel_tensor(self, tensor: torch.Tensor) -> bool:
         return tensor.device.type == self.torch_device_type
 
+    def tensor_mem_type(self, tensor: torch.Tensor) -> int:
+        from modelexpress import p2p_pb2
+
+        if self.is_accel_tensor(tensor):
+            return p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
+        if tensor.device.type == "cpu":
+            return p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        raise ValueError(f"Cannot register a tensor on {tensor.device} for transfer")
+
     def supports_rdma_p2p(self) -> bool:
         return self.rdma_p2p
 
@@ -62,6 +72,9 @@ class MockAcceleratorBackend:
 
     def supports_gds(self) -> bool:
         return self.gds
+
+    def requires_classic_alloc_pool(self) -> bool:
+        return self.classic_alloc_pool
 
 
 @pytest.fixture
@@ -163,6 +176,13 @@ def _maybe_mock_vllm():
         "vllm.distributed.weight_transfer.base": MagicMock(),
         "vllm.distributed.weight_transfer.factory": MagicMock(),
     }
+
+    # Explicit attributes survive monkeypatch teardown under pytest 9.2.
+    vllm_mods["vllm.model_executor.model_loader.default_loader"].DefaultModelLoader = MagicMock()
+    vllm_mods["vllm.model_executor.model_loader.utils"].initialize_model = MagicMock()
+    vllm_mods["vllm.model_executor.model_loader"]._LOAD_FORMAT_TO_MODEL_LOADER = {}
+    vllm_mods["vllm"].model_executor = vllm_mods["vllm.model_executor"]
+    vllm_mods["vllm.model_executor"].model_loader = vllm_mods["vllm.model_executor.model_loader"]
 
     # Wire up real objects where behavior matters
     vllm_mods["vllm.model_executor.layers.attention_layer_base"].AttentionLayerBase = attention_layer_base

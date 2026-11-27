@@ -5,13 +5,14 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from modelexpress import p2p_pb2
 from modelexpress.accelerators import (
     CudaAcceleratorBackend,
     XpuAcceleratorBackend,
@@ -34,6 +35,7 @@ class TestCudaAcceleratorBackend:
         assert backend.supports_pool_reg() is True
         assert backend.supports_vmm() is True
         assert backend.supports_gds() is True
+        assert backend.requires_classic_alloc_pool() is True
 
     def test_cuda_backend_delegates_torch_calls(self, monkeypatch):
         calls = []
@@ -78,6 +80,17 @@ class TestCudaAcceleratorBackend:
 
         assert backend.is_accel_tensor(FakeCudaTensor()) is True
 
+    def test_cuda_backend_tensor_mem_type(self):
+        backend = CudaAcceleratorBackend()
+
+        class FakeCudaTensor:
+            is_cuda = True
+
+        assert backend.tensor_mem_type(FakeCudaTensor()) == p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
+        assert backend.tensor_mem_type(torch.zeros(1)) == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        with pytest.raises(ValueError, match="meta"):
+            backend.tensor_mem_type(torch.empty(1, device="meta"))
+
     def test_accelerator_backend_for_cuda(self):
         assert isinstance(
             accelerator_backend_for(torch.device("cuda:0")),
@@ -100,6 +113,7 @@ class TestXpuAcceleratorBackend:
         assert backend.supports_pool_reg() is False
         assert backend.supports_vmm() is False
         assert backend.supports_gds() is False
+        assert backend.requires_classic_alloc_pool() is False
 
     def test_xpu_backend_delegates_torch_calls(self, monkeypatch):
         calls = []
@@ -178,6 +192,18 @@ class TestXpuAcceleratorBackend:
         assert backend.is_accel_tensor(FakeTensor("cuda")) is False
         assert backend.is_accel_tensor(FakeTensor("cpu")) is False
 
+    def test_xpu_backend_tensor_mem_type(self):
+        backend = XpuAcceleratorBackend()
+
+        class FakeTensor:
+            def __init__(self, device_type):
+                self.device = SimpleNamespace(type=device_type)
+
+        assert backend.tensor_mem_type(FakeTensor("xpu")) == p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
+        assert backend.tensor_mem_type(FakeTensor("cpu")) == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        with pytest.raises(ValueError, match="cuda"):
+            backend.tensor_mem_type(FakeTensor("cuda"))
+
     def test_xpu_backend_torch_device(self):
         assert XpuAcceleratorBackend().torch_device(1) == torch.device("xpu", 1)
 
@@ -217,7 +243,7 @@ class TestAcceleratorCapabilityGates:
         monkeypatch,
         mock_accelerator_backend_cls,
     ):
-        backend = mock_accelerator_backend_cls(pool_reg=False)
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu", pool_reg=False)
         mgr = self._make_manager(backend)
         tensor = torch.zeros(4, dtype=torch.float32)
         monkeypatch.setenv("MX_POOL_REG", "1")
@@ -240,7 +266,7 @@ class TestAcceleratorCapabilityGates:
         mock_accelerator_backend_cls,
     ):
         monkeypatch.delenv("MX_POOL_REG", raising=False)
-        mgr = self._make_manager(mock_accelerator_backend_cls())
+        mgr = self._make_manager(mock_accelerator_backend_cls(torch_device_type="cpu"))
         tensor = torch.zeros(4, dtype=torch.float32)
         empty = torch.empty(0, dtype=torch.float32)
 
@@ -263,7 +289,7 @@ class TestAcceleratorCapabilityGates:
             def registered_range(self):
                 return 0x1000, 0x2000
 
-        backend = mock_accelerator_backend_cls(vmm=False)
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu", vmm=False)
         mgr = self._make_manager(backend)
         tensor = torch.zeros(1)
 
@@ -337,6 +363,76 @@ class TestAcceleratorCapabilityGates:
             side_effect=AssertionError("system GDS probe should not run"),
         ):
             assert GdsStrategy().is_available(ctx) is False
+
+    def test_registered_buffer_scope_is_a_noop_without_a_pool_requirement(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        from modelexpress_rl.refit.reshard import cuda_pool
+        from modelexpress_rl.refit.reshard.alloc_scope import (
+            registered_buffer_alloc_scope,
+        )
+
+        backend = mock_accelerator_backend_cls(classic_alloc_pool=False)
+
+        with patch.object(
+            cuda_pool,
+            "_get_pool",
+            side_effect=AssertionError("classic pool should not be built"),
+        ):
+            scope = registered_buffer_alloc_scope(backend)
+            assert isinstance(scope, type(nullcontext()))
+            with scope:
+                pass
+
+    def test_registered_buffer_scope_uses_the_classic_pool_when_required(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        from modelexpress_rl.refit.reshard import cuda_pool
+        from modelexpress_rl.refit.reshard.alloc_scope import (
+            registered_buffer_alloc_scope,
+        )
+
+        backend = mock_accelerator_backend_cls(
+            name="cuda",
+            classic_alloc_pool=True,
+        )
+        entered = []
+
+        @contextmanager
+        def fake_use_mem_pool(pool, device=None):
+            entered.append(pool)
+            yield
+
+        with patch.object(cuda_pool, "_get_pool", return_value="pool"):
+            with patch.object(torch.cuda, "use_mem_pool", fake_use_mem_pool):
+                with registered_buffer_alloc_scope(backend):
+                    pass
+
+        assert entered == ["pool"]
+
+    def test_registered_buffer_scope_rejects_an_unimplemented_backend_pool(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        from modelexpress_rl.refit.reshard import cuda_pool
+        from modelexpress_rl.refit.reshard.alloc_scope import (
+            registered_buffer_alloc_scope,
+        )
+
+        backend = mock_accelerator_backend_cls(
+            name="rocm",
+            classic_alloc_pool=True,
+        )
+
+        with patch.object(
+            cuda_pool,
+            "_get_pool",
+            side_effect=AssertionError("CUDA pool should not be built"),
+        ):
+            with pytest.raises(NotImplementedError, match="rocm"):
+                registered_buffer_alloc_scope(backend)
 
     def test_vmm_runtime_noops_when_backend_does_not_support_arena(
         self,

@@ -9,6 +9,9 @@ package model_express.p2p;
 // The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
 // Clients query for existing sources and publish their own metadata.
 service P2pService {
+  // Coordinate a donor for concurrent cold starts.
+  rpc DonorLease(DonorLeaseRequest) returns (DonorLeaseResponse);
+
   // Publish model metadata - called by client after loading model weights
   rpc PublishMetadata(PublishMetadataRequest) returns (PublishMetadataResponse);
 
@@ -124,21 +127,31 @@ message SourceIdentity {
 // Tensor Descriptors
 // ============================================================================
 
+// Where a tensor's bytes live, as NIXL registers them.
+enum TensorMemoryType {
+  TENSOR_MEMORY_TYPE_VRAM = 0;  // accelerator memory (default)
+  TENSOR_MEMORY_TYPE_DRAM = 1;  // host memory
+}
+
 message TensorDescriptor {
   // Tensor name (e.g., "model.layers.0.self_attn.q_proj.weight")
   string name = 1;
 
-  // GPU memory address
+  // Memory address (device or host, see mem_type)
   uint64 addr = 2;
 
   // Size in bytes
   uint64 size = 3;
 
-  // GPU device ID (0-7 for 8-GPU setup)
+  // Accelerator device ID (0-7 for 8-GPU setup); 0 for host memory
   uint32 device_id = 4;
 
   // Data type (e.g., "float16", "bfloat16")
   string dtype = 5;
+
+  // Memory type of addr. Old publishers leave this unset, which decodes as
+  // VRAM, the only kind published before this field existed.
+  TensorMemoryType mem_type = 6;
 }
 
 // Small discovery summary for file-backed artifact sources. This does not carry
@@ -540,7 +553,9 @@ message PublishMetadataRequest {
 
   // Unique identifier for this running instance (UUID).
   // Differentiates multiple replicas with identical SourceIdentity.
-  // If empty, the server rejects the request.
+  // At most 63 bytes of lowercase alphanumerics, '-' and '.', where every
+  // dot-separated segment starts and ends with an alphanumeric. A UUID
+  // satisfies this. The server rejects an empty or non-conforming value.
   string worker_id = 3;
 
   // Kubernetes pod name of the calling worker, set via the downward API.
@@ -649,6 +664,8 @@ message ListSourcesRequest {
 
   // Return newest workers first and cap the response. Zero/unset means no cap.
   optional uint32 limit = 7;
+  // Return an error instead of an empty list on a metadata backend failure.
+  bool strict = 8;
 }
 
 message ListSourcesResponse {
@@ -715,4 +732,27 @@ message UpdateStatusRequest {
 message UpdateStatusResponse {
   bool success = 1;
   string message = 2;
+}
+
+// Donor leases are scoped to the server-computed source identity.
+enum DonorLeaseAction {
+  DONOR_LEASE_ACTION_UNSPECIFIED = 0;
+  DONOR_LEASE_ACTION_ACQUIRE = 1;
+  DONOR_LEASE_ACTION_RENEW = 2;
+  DONOR_LEASE_ACTION_RELEASE = 3;
+}
+
+message DonorLeaseRequest {
+  SourceIdentity identity = 1;
+  string owner_token = 2;
+  DonorLeaseAction action = 3;
+  uint64 ttl_seconds = 4;
+}
+
+message DonorLeaseResponse {
+  // True if the requested action succeeded: ACQUIRE obtained the lease,
+  // RENEW extended a lease owned by the caller, or RELEASE removed it.
+  // False means the action did not succeed, typically because another caller
+  // owns the lease or the caller's lease has expired.
+  bool success = 1;
 }

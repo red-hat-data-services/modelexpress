@@ -11,8 +11,13 @@ module is how a read of a nonexistent ParallelConfig attribute went unnoticed.
 
 from __future__ import annotations
 
+import re
+from importlib.metadata import version as pkg_version
+
 from ... import envs
 from ... import p2p_pb2
+
+_COMMIT_HASH = re.compile(r"[0-9a-f]{40}")
 
 
 def _derive_expert_parallel_size(parallel) -> int:
@@ -41,12 +46,25 @@ def _derive_expert_parallel_size(parallel) -> int:
     return max(1, tp_size * dp_size * pcp_size)
 
 
+def _vllm_version() -> str:
+    try:
+        import vllm
+
+        version = getattr(vllm, "__version__", "")
+        if isinstance(version, str) and version:
+            return version
+    except Exception:
+        pass
+    try:
+        return pkg_version("vllm")
+    except Exception:
+        return ""
+
+
 def build_source_identity(
     vllm_config, model_config,
 ) -> p2p_pb2.SourceIdentity:
     """Build a SourceIdentity from vLLM config objects."""
-    from importlib.metadata import version as pkg_version
-
     try:
         mx_version = pkg_version("modelexpress")
     except Exception:
@@ -72,6 +90,21 @@ def build_source_identity(
         dtype=dtype,
         quantization=quantization,
         revision=_resolve_model_revision(model_config),
+        # Parameter names and post-processed layouts can change between vLLM
+        # releases, so workers on different versions must not share a source.
+        backend_framework_version=_vllm_version(),
+        extra_parameters=(
+            {
+                f"vllm_{name}": str(getattr(parallel, name, 1) or 1)
+                for name in (
+                    "data_parallel_size",
+                    "prefill_context_parallel_size",
+                    "decode_context_parallel_size",
+                )
+            }
+            if envs.MX_P2P_COLD_START
+            else {}
+        ),
     )
 
 
@@ -92,3 +125,14 @@ def _resolve_model_revision(model_config) -> str:
         return override
     revision = getattr(model_config, "revision", None)
     return revision or ""
+
+
+def is_pinned_revision(model_config) -> bool:
+    """Whether the identity revision names one checkpoint.
+
+    A deployer override counts as pinned. A vLLM revision must be a full commit
+    hash, since a branch or tag can move under the same name.
+    """
+    if envs.MX_MODEL_REVISION:
+        return True
+    return _COMMIT_HASH.fullmatch(_resolve_model_revision(model_config)) is not None

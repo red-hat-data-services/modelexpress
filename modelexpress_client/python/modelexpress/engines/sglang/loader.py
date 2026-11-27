@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
+from bisect import bisect_right
+from collections.abc import Iterable, Iterator
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING
@@ -40,6 +43,7 @@ from ...topology import (
 from .adapter import (
     _get_model_name,
     build_sglang_load_context,
+    build_sglang_source_identity,
     is_sglang_draft_model,
 )
 from .artifacts import (
@@ -50,11 +54,37 @@ from .artifacts import (
 from .draft_weights import draft_tensor_namespace, draft_weight_adapter_for
 
 logger = logging.getLogger("modelexpress.engines.sglang.loader")
+_TRANSFER_ENGINE_BATCH_BYTES = 1024 * 1024 * 1024
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
+
+
+class _TransferEngineReceiveError(RuntimeError):
+    pass
+
+
+def _iter_receive_batches(
+    ranges: Iterable[tuple[int, int, int]], max_bytes: int
+) -> Iterator[list[tuple[int, int, int]]]:
+    batch = []
+    used = 0
+    for local, remote, remaining in ranges:
+        while remaining:
+            size = min(remaining, max_bytes - used)
+            batch.append((local, remote, size))
+            local += size
+            remote += size
+            remaining -= size
+            used += size
+            if used == max_bytes:
+                yield batch
+                batch = []
+                used = 0
+    if batch:
+        yield batch
 
 
 class _DraftPublicationGate:
@@ -92,6 +122,10 @@ class _DraftPublicationGate:
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
 _loader_registry: dict[int, MxModelLoader] = {}
+# Keep native operations and registered storage alive if a load is interrupted.
+_pending_transfer_engine_receives: dict[
+    object, tuple[object | None, object, dict[str, torch.Tensor]]
+] = {}
 # Main-pass publication gates awaiting this device's speculative draft pass.
 _draft_publication_gates: dict[int, _DraftPublicationGate] = {}
 
@@ -119,13 +153,10 @@ def _speculative_server_args():
         return None
 
 
-def _expects_draft_pass() -> bool:
-    """True when SGLang will run a draft ModelRunner load through this loader.
-
-    NGRAM speculation has no draft model, and a draft with its own
-    ``speculative_draft_load_format`` never reaches the remote_instance
-    backend.
-    """
+def _expects_draft_pass(ctx: LoadContext) -> bool:
+    """Wait only for an MX draft that can join the main P2P publication."""
+    if not ctx.p2p_enabled or envs.MX_DISABLE_DRAFT_P2P:
+        return False
     spec = _speculative_server_args()
     algorithm = getattr(spec, "speculative_algorithm", None)
     algorithm = str(getattr(algorithm, "name", algorithm) or "").upper()
@@ -133,7 +164,64 @@ def _expects_draft_pass() -> bool:
         return False
     draft_format = getattr(spec, "speculative_draft_load_format", None)
     draft_format = getattr(draft_format, "value", draft_format)
-    return draft_format is None or str(draft_format) == "remote_instance"
+    if draft_format is not None and str(draft_format) != "remote_instance":
+        return False
+    draft_config = copy.copy(ctx.model_config)
+    draft_config.model_path = (
+        getattr(spec, "speculative_draft_model_path", None)
+        or _get_model_name(ctx.model_config)
+    )
+    for attr in ("revision", "quantization"):
+        value = getattr(spec, f"speculative_draft_model_{attr}", None)
+        if value is not None:
+            setattr(draft_config, attr, value)
+    return build_sglang_source_identity(draft_config) == ctx.identity
+
+
+def _coalesce_cuda_memory_regions(
+    regions: dict[int, int],
+) -> list[tuple[int, int]]:
+    """Merge occupied allocator blocks within a single CUDA allocation."""
+    blocks: list[tuple[int, int, int]] = []
+    try:
+        for segment in torch.cuda.memory_snapshot():
+            if segment.get("is_expandable", True):
+                continue
+            for block in segment["blocks"]:
+                if block["state"] != "active_allocated":
+                    continue
+                block_start = block["address"]
+                block_end = block_start + block["size"]
+                blocks.append((block_start, block_end, segment["address"]))
+    except (AttributeError, KeyError, TypeError, RuntimeError) as exc:
+        logger.warning(
+            "Cannot inspect CUDA allocations; registering individual tensors: %s", exc
+        )
+        return list(regions.items())
+
+    blocks.sort()
+    block_starts = [start for start, _, _ in blocks]
+    merged: list[tuple[int, int, int | None]] = []
+    for addr, size in sorted(regions.items()):
+        start, end = addr, addr + size
+        segment: int | None = None
+        # Expand only when the block covers the entire tensor range.
+        index = bisect_right(block_starts, addr) - 1
+        if index >= 0 and end <= blocks[index][1]:
+            start, end, segment = blocks[index]
+
+        if merged:
+            prev_start, prev_end, prev_segment = merged[-1]
+            same_segment = segment is not None and segment == prev_segment
+            if same_segment and start <= prev_end:
+                merged[-1] = (prev_start, max(prev_end, end), segment)
+                continue
+            if start < prev_end:
+                # An unrecognized range overlaps an expanded allocator block.
+                return list(regions.items())
+        merged.append((start, end, segment))
+
+    return [(start, end - start) for start, end, _ in merged]
 
 
 class MxModelLoader:
@@ -163,6 +251,9 @@ class MxModelLoader:
         device_config: DeviceConfig,
     ) -> nn.Module:
         """Load model weights through the shared ModelExpress strategy chain."""
+        from modelexpress import configure_sglang_logging
+
+        configure_sglang_logging()
         transport = getattr(self.load_config, "modelexpress_transport", "nixl")
         self._validate_load_policy(transport)
         # L0 wraps the dispatcher rather than each transport, so the
@@ -227,10 +318,22 @@ class MxModelLoader:
         if is_draft:
             main_loader = _loader_registry.get(ctx.device_id)
             main_ctx = main_loader._ctx if main_loader is not None else None
+            target_path = (
+                _get_model_name(main_ctx.model_config)
+                if main_ctx is not None
+                else getattr(_speculative_server_args(), "model_path", None)
+            )
+            if _get_model_name(model_config) != target_path:
+                ctx.model_streamer_uri = _get_model_name(model_config)
             draft_adapter = draft_weight_adapter_for(
                 type(model).__name__, role="draft", model=model
             )
-            same_checkpoint = main_ctx is not None and main_ctx.identity == ctx.identity
+            same_checkpoint = (
+                main_ctx is not None
+                and main_ctx.p2p_enabled
+                and ctx.p2p_enabled
+                and main_ctx.identity == ctx.identity
+            )
             compatible_adapter = (
                 same_checkpoint
                 and draft_adapter is not None
@@ -261,17 +364,18 @@ class MxModelLoader:
                 # draft identity fall back to SGLang's storage loader.
                 ctx.p2p_enabled = False
             draft_gate = _draft_publication_gates.pop(ctx.device_id, None)
-        elif _expects_draft_pass():
+        elif _expects_draft_pass(ctx):
             self._draft_weight_adapter = draft_weight_adapter_for(
                 type(model).__name__, role="main", model=model
             )
             self._strict_draft_publication = (
-                self._draft_weight_adapter is not None and not envs.MX_DISABLE_DRAFT_P2P
+                self._draft_weight_adapter is not None
+                and ctx.identity.pipeline_parallel_size == 1
+                and bool(ctx.identity.revision)
+                and bool(_sglang_version())
             )
-            if self._strict_draft_publication or not envs.MX_ARTIFACT_READY_URL.strip():
-                main_gate = _DraftPublicationGate(
-                    grace_secs=None if self._strict_draft_publication else 600.0
-                )
+            if self._strict_draft_publication:
+                main_gate = _DraftPublicationGate(grace_secs=None)
                 _draft_publication_gates[ctx.device_id] = main_gate
                 if envs.MX_ARTIFACT_READY_URL.strip():
                     ctx.source_ready_fn = (
@@ -398,7 +502,6 @@ class MxModelLoader:
                 "SGLang ModelExpress transfer_engine transport requires an "
                 "initialized SGLang TransferEngine and session id."
             )
-
         logger.info(
             "[Worker %s] SGLang MxModelLoader starting transfer_engine "
             "(model=%s)",
@@ -417,15 +520,22 @@ class MxModelLoader:
             result = ctx.adapter.load_via_native(result)
             tensors = ctx.adapter.discover_tensors(result)
         else:
-            registered_tensors = None
+            if not callable(getattr(transfer_engine, "submit_scatter_read", None)):
+                raise RuntimeError(
+                    "SGLang ModelExpress transfer_engine receive requires "
+                    "Mooncake >=0.3.14 with submit_scatter_read completion tickets."
+                )
+            registered_ptrs = set()
             try:
                 result = ctx.adapter.before_rdma_receive(result)
+                ctx.adapter.prepare_rdma_target_from_manifest(
+                    result, list(worker_tensor_descriptors(source_worker))
+                )
                 tensors = ctx.adapter.discover_tensors(result)
-                weight_info = self._register_transfer_engine_tensors(
+                weight_info, registered_ptrs = self._register_transfer_engine_tensors(
                     tensors,
                     transfer_engine,
                 )
-                registered_tensors = tensors
                 self._receive_via_transfer_engine(
                     tensors,
                     transfer_engine,
@@ -433,12 +543,17 @@ class MxModelLoader:
                     ctx,
                 )
                 result = ctx.adapter.after_rdma_receive(result)
+            except _TransferEngineReceiveError:
+                logger.critical(
+                    "[Worker %s] TransferEngine receive failed with unknown "
+                    "completion; retaining the operation and registered buffers "
+                    "without native fallback; worker recovery is required",
+                    ctx.global_rank,
+                    exc_info=True,
+                )
+                raise
             except Exception as exc:
-                if registered_tensors is not None:
-                    self._unregister_transfer_engine_tensors(
-                        registered_tensors,
-                        transfer_engine,
-                    )
+                self._unregister_transfer_engine_ptrs(registered_ptrs, transfer_engine)
                 logger.warning(
                     "[Worker %s] TransferEngine load failed, falling back "
                     "to native load: %s",
@@ -446,7 +561,6 @@ class MxModelLoader:
                     exc,
                     exc_info=True,
                 )
-                registered_tensors = None
                 tensors = {}
                 clear_exception_tracebacks(exc)
                 result = ctx.adapter.reinit_for_retry(result)
@@ -456,7 +570,7 @@ class MxModelLoader:
 
         if weight_info is None:
             try:
-                weight_info = self._register_transfer_engine_tensors(
+                weight_info, _ = self._register_transfer_engine_tensors(
                     tensors,
                     transfer_engine,
                 )
@@ -564,14 +678,41 @@ class MxModelLoader:
         source_worker,
         ctx: LoadContext,
     ) -> None:
+        ranges = self._transfer_engine_receive_ranges(tensors, source_worker)
+        logger.info(
+            "[Worker %s] Receiving %d tensors via TransferEngine",
+            ctx.global_rank,
+            len(ranges),
+        )
+        for batch in _iter_receive_batches(ranges, _TRANSFER_ENGINE_BATCH_BYTES):
+            self._receive_transfer_engine_batch(
+                batch,
+                transfer_engine,
+                session_id=source_worker.transfer_engine_session_id,
+                tensors=tensors,
+                global_rank=ctx.global_rank,
+            )
+
+    def _transfer_engine_receive_ranges(
+        self,
+        tensors: dict[str, torch.Tensor],
+        source_worker,
+    ) -> list[tuple[int, int, int]]:
+        """Validate the full manifest before any receive is submitted."""
         seed_weight_info = {
             tensor.name: (tensor.addr, tensor.size)
             for tensor in worker_tensor_descriptors(source_worker)
         }
 
-        seed_ptr_list = []
-        client_ptr_list = []
-        client_len_list = []
+        source_only = sorted(set(seed_weight_info) - set(tensors))
+        if source_only:
+            raise RuntimeError(
+                f"ModelExpress transfer_engine: {len(source_only)} source-only tensors "
+                "(first five): "
+                f"{source_only[:5]}"
+            )
+
+        ranges = []
         for name, tensor in tensors.items():
             weight_info = seed_weight_info.get(name)
             if weight_info is None:
@@ -588,80 +729,141 @@ class MxModelLoader:
                 )
             if local_size == 0:
                 continue
-            seed_ptr_list.append(seed_ptr)
-            client_ptr_list.append(tensor.data_ptr())
-            client_len_list.append(local_size)
+            ranges.append((tensor.data_ptr(), seed_ptr, local_size))
 
-        logger.info(
-            "[Worker %s] Receiving %d tensors via TransferEngine",
-            ctx.global_rank,
-            len(seed_ptr_list),
-        )
-        ret = transfer_engine.batch_transfer_sync_read(
-            source_worker.transfer_engine_session_id,
-            client_ptr_list,
-            seed_ptr_list,
-            client_len_list,
-        )
-        if ret < 0:
-            raise RuntimeError(
-                f"ModelExpress transfer_engine: batch_transfer_sync_read failed "
-                f"with error={ret}"
+        return ranges
+
+    def _receive_transfer_engine_batch(
+        self,
+        batch: list[tuple[int, int, int]],
+        transfer_engine,
+        *,
+        session_id: str,
+        tensors: dict[str, torch.Tensor],
+        global_rank: int,
+    ) -> None:
+        local_ptrs, remote_ptrs, lengths = map(list, zip(*batch))
+        owner = object()
+        _pending_transfer_engine_receives[owner] = (None, transfer_engine, tensors)
+        try:
+            ticket = transfer_engine.submit_scatter_read(
+                session_id,
+                local_ptrs,
+                lengths,
+                remote_ptrs,
+                lengths,
+                [[0] for _ in lengths],
+                [[0] for _ in lengths],
+                [[size] for size in lengths],
             )
+            _pending_transfer_engine_receives[owner] = (
+                ticket, transfer_engine, tensors
+            )
+            self._drain_transfer_engine_ticket(ticket, global_rank, sum(lengths))
+        except Exception as exc:
+            raise _TransferEngineReceiveError(
+                "ModelExpress transfer_engine: receive raised with unknown "
+                "completion; operation and buffers retained"
+            ) from exc
+        del _pending_transfer_engine_receives[owner]
+        if ticket.status.name != "COMPLETED":
+            raise RuntimeError(
+                "ModelExpress transfer_engine: receive failed after draining "
+                f"with status={ticket.status}"
+            )
+
+    @staticmethod
+    def _drain_transfer_engine_ticket(
+        ticket, global_rank: int, batch_bytes: int
+    ) -> None:
+        """Wait for physical completion, warning every 30 seconds while pending."""
+        started = time.monotonic()
+        next_warning = started + 30
+        while not ticket.drained:
+            ticket.drain(1000)
+            if ticket.drained:
+                break
+            now = time.monotonic()
+            if now >= next_warning:
+                logger.warning(
+                    "[Worker %s] TransferEngine receive still pending after "
+                    "%.1fs (batch_bytes=%d); "
+                    "retaining registered buffers while draining",
+                    global_rank,
+                    now - started,
+                    batch_bytes,
+                )
+                next_warning = now + 30
 
     def _register_transfer_engine_tensors(
         self,
         tensors: dict[str, torch.Tensor],
         transfer_engine,
-    ) -> dict[str, tuple[int, int, int]]:
-        weight_info = {}
-        registered_ptrs = set()
-        try:
-            for name, tensor in tensors.items():
-                addr = tensor.data_ptr()
-                numel = tensor.numel()
-                element_size = tensor.element_size()
-                size = self._byte_size(numel, element_size)
-                weight_info[name] = (addr, numel, element_size)
-                if size == 0:
-                    continue
-                if addr not in registered_ptrs:
+    ) -> tuple[dict[str, tuple[int, int, int]], set[int]]:
+        """Register tensor storage and return transfer metadata and registered bases."""
+        start = time.perf_counter()
+        weight_info = {
+            name: (tensor.data_ptr(), tensor.numel(), tensor.element_size())
+            for name, tensor in tensors.items()
+        }
+        regions: dict[int, int] = {}
+        for addr, numel, element_size in weight_info.values():
+            size = self._byte_size(numel, element_size)
+            if size:
+                regions[addr] = max(regions.get(addr, 0), size)
+        attempts: list[tuple[str, Iterable[tuple[int, int]]]] = []
+        if regions and next(iter(tensors.values())).is_cuda:
+            preferred_regions = _coalesce_cuda_memory_regions(regions)
+            if len(preferred_regions) != len(regions) or any(
+                regions.get(addr) != size for addr, size in preferred_regions
+            ):
+                attempts.append(("coalesced", preferred_regions))
+        attempts.append(("original", regions.items()))
+
+        for attempt, registration_regions in attempts:
+            registered_ptrs = set()
+            registered_bytes = 0
+            try:
+                for addr, size in registration_regions:
                     ret = transfer_engine.register_memory(addr, size)
                     if ret != 0:
-                        raise RuntimeError(
-                            "ModelExpress transfer_engine: register_memory failed "
-                            f"for tensor {name!r}, error={ret}"
-                        )
+                        raise RuntimeError(f"register_memory returned error={ret}")
                     registered_ptrs.add(addr)
-        except Exception:
-            self._unregister_transfer_engine_ptrs(
-                registered_ptrs,
-                transfer_engine,
-            )
-            raise
-        return weight_info
-
-    def _unregister_transfer_engine_tensors(
-        self,
-        tensors: dict[str, torch.Tensor],
-        transfer_engine,
-    ) -> None:
-        registered_ptrs = {
-            tensor.data_ptr()
-            for tensor in tensors.values()
-            if self._byte_size(tensor.numel(), tensor.element_size()) > 0
-        }
-        self._unregister_transfer_engine_ptrs(registered_ptrs, transfer_engine)
+                    registered_bytes += size
+            except Exception as exc:
+                rolled_back = self._unregister_transfer_engine_ptrs(
+                    registered_ptrs, transfer_engine
+                )
+                logger.warning(
+                    "TransferEngine registration failed (%s attempt, %s)",
+                    attempt,
+                    exc,
+                )
+                if not rolled_back or attempt == "original":
+                    raise
+            else:
+                break
+        logger.info(
+            "Registered %d TransferEngine regions for %d tensors (%d bytes) in %.3fs",
+            len(registered_ptrs),
+            len(tensors),
+            registered_bytes,
+            time.perf_counter() - start,
+        )
+        return weight_info, registered_ptrs
 
     def _unregister_transfer_engine_ptrs(
         self,
         registered_ptrs: set[int],
         transfer_engine,
-    ) -> None:
+    ) -> bool:
+        """Try every registered base and report whether all were unregistered."""
+        all_unregistered = True
         for addr in registered_ptrs:
             try:
                 ret = transfer_engine.unregister_memory(addr)
                 if ret != 0:
+                    all_unregistered = False
                     logger.warning(
                         "ModelExpress transfer_engine: unregister_memory failed "
                         "for address %s, error=%s",
@@ -669,11 +871,13 @@ class MxModelLoader:
                         ret,
                     )
             except Exception:
+                all_unregistered = False
                 logger.exception(
                     "ModelExpress transfer_engine: unregister_memory raised "
                     "for address %s",
                     addr,
                 )
+        return all_unregistered
 
     def _publish_transfer_engine_source(
         self,
@@ -689,6 +893,7 @@ class MxModelLoader:
                     addr=addr,
                     size=self._byte_size(numel, element_size),
                     device_id=ctx.device_id,
+                    dtype=str(ctx.tensors[name].dtype),
                 )
                 for name, (addr, numel, element_size) in weight_info.items()
             ]

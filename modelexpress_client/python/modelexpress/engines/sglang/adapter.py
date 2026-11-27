@@ -25,6 +25,8 @@ from ...tensor_utils import (
     collect_module_tensors,
 )
 from .draft_weights import draft_weight_adapter_for
+from .readiness import sglang_server_readiness
+from .runtime_state import finalize_runtime_state, prepare_runtime_tensors
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -33,6 +35,8 @@ if TYPE_CHECKING:
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.runtime_context import ParallelContext
+
+    from ...types import TensorDescriptor
 
 
 class SglangAdapter(EngineAdapter):
@@ -78,6 +82,22 @@ class SglangAdapter(EngineAdapter):
 
         return int(parallel_state.get_world_group().local_rank)
 
+    def all_gather_state(self, state) -> tuple[object, ...]:
+        """Gather rank-local state through SGLang's world CPU process group."""
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return (state,)
+
+        parallel = _get_sglang_parallel_context()
+        if parallel is not None:
+            group = parallel.world_group
+        else:
+            from sglang.srt.distributed import parallel_state
+
+            group = parallel_state.get_world_group()
+        states = [None] * group.world_size
+        torch.distributed.all_gather_object(states, state, group=group.cpu_group)
+        return tuple(states)
+
     def get_device_id(self) -> int:
         gpu_id = getattr(self.device_config, "gpu_id", None)
         if gpu_id is not None:
@@ -94,7 +114,23 @@ class SglangAdapter(EngineAdapter):
 
         return bool(is_cuda_alike())
 
+    @staticmethod
+    def _exclude_hidden_tensor_object(obj: object) -> bool:
+        """Keep distributed process groups and communicators local."""
+        module = (type(obj).__module__ or "") + "."
+        return module.startswith(
+            (
+                "sglang.srt.distributed.",
+                "sglang.srt.layers.communication.",
+                "torch.distributed.",
+            )
+        )
+
+    def discovers_host_parameters(self) -> bool:
+        return True
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
+        """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
         # capture_tensor_attrs() only promotes bare Tensor attributes assigned
@@ -110,8 +146,16 @@ class SglangAdapter(EngineAdapter):
         # This adds _mx_* names to the manifest, so source and target must run
         # the same ModelExpress version; mixing old and new manifests fails
         # tensor matching.
-        adopt_hidden_tensors(result.model, self.accelerator_backend)
-        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        adopt_hidden_tensors(
+            result.model,
+            self.accelerator_backend,
+            exclude=self._exclude_hidden_tensor_object,
+        )
+        tensors = collect_module_tensors(
+            result.model,
+            self.accelerator_backend,
+            include_host_parameters=self.discovers_host_parameters(),
+        )
         if is_sglang_draft_model(self.model_config):
             selector = draft_weight_adapter_for(
                 type(result.model).__name__, role="draft", model=result.model
@@ -128,10 +172,27 @@ class SglangAdapter(EngineAdapter):
                     }
         return tensors
 
+    def requires_exact_tensor_catalog(self) -> bool:
+        """Require complete catalogs to keep quantization state consistent."""
+        return True
+
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):
             result = self._post_load_weights(result)
             return self._process_weights_after_loading(result)
+
+    def prepare_rdma_target_from_manifest(
+        self, result: LoadResult, source_tensors: list[TensorDescriptor]
+    ) -> None:
+        if result.model is None:
+            raise RuntimeError("SGLang runtime preparation requires result.model")
+        prepare_runtime_tensors(result.model, source_tensors)
+
+    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
+        if result.model is None:
+            raise RuntimeError("SGLang runtime finalization requires result.model")
+        finalize_runtime_state(result.model)
+        return result
 
     def apply_weight_iter(
         self,
@@ -470,11 +531,14 @@ def build_sglang_load_context(
 ) -> LoadContext:
     """Build a LoadContext from SGLang config objects."""
 
+    from . import artifacts
+
     adapter = SglangAdapter(load_config, model_config, device_config)
     worker_rank = adapter.get_worker_rank()
     global_rank = adapter.get_global_rank()
     server_url = getattr(load_config, "modelexpress_url", None)
-    return LoadContext(
+    readiness = sglang_server_readiness()
+    ctx = LoadContext(
         model_config=model_config,
         load_config=load_config,
         target_device=adapter.get_target_device(),
@@ -491,3 +555,5 @@ def build_sglang_load_context(
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )
+    ctx.artifact_ready_fn = lambda: artifacts._sglang_health_ready(ctx, readiness)
+    return ctx

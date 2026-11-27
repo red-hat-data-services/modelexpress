@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
+from .. import p2p_pb2
 from .base import NIXL_ACCELERATOR_MEM_TYPE
 
 
@@ -67,6 +68,13 @@ class XpuAcceleratorBackend:
     def is_accel_tensor(self, tensor: torch.Tensor) -> bool:
         return tensor.device.type == self.torch_device_type
 
+    def tensor_mem_type(self, tensor: torch.Tensor) -> int:
+        if self.is_accel_tensor(tensor):
+            return p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
+        if tensor.device.type == "cpu":
+            return p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        raise ValueError(f"Cannot register a tensor on {tensor.device} for transfer")
+
     def supports_rdma_p2p(self) -> bool:
         return True
 
@@ -77,4 +85,12 @@ class XpuAcceleratorBackend:
         return False
 
     def supports_gds(self) -> bool:
+        return False
+
+    def requires_classic_alloc_pool(self) -> bool:
+        # The classic pool works around a CUDA-specific interaction between
+        # expandable-segment allocations and nvidia_peermem pinning; no equivalent
+        # hazard is known or has been observed on XPU. Not a proof of absence -
+        # modelexpress_rl/refit/reshard/cuda_pool.py has the failure signature and
+        # docs/rl/ARCHITECTURE.md what would settle it.
         return False

@@ -55,6 +55,14 @@ class AcceleratorBackend(Protocol):
         """Return whether ``tensor`` lives on this backend's accelerator memory."""
         ...
 
+    def tensor_mem_type(self, tensor: torch.Tensor) -> int:
+        """Return the ``p2p_pb2.TensorMemoryType`` NIXL registers ``tensor`` as.
+
+        Raises ``ValueError`` for a tensor neither on this accelerator nor in
+        host memory.
+        """
+        ...
+
     def supports_rdma_p2p(self) -> bool:
         """Return whether this backend supports NIXL RDMA P2P transfers."""
         ...
@@ -69,4 +77,16 @@ class AcceleratorBackend(Protocol):
 
     def supports_gds(self) -> bool:
         """Return whether GPUDirect Storage loading is supported."""
+        ...
+
+    def requires_classic_alloc_pool(self) -> bool:
+        """Return whether NIXL-registered buffers must come from a separate
+        classic-allocation pool on this backend.
+
+        A requirement, not a capability: True where this backend's default torch
+        allocator can hand out a range the HCA cannot pin, so registered buffers
+        have to be scoped into a classic-allocation pool instead (see
+        ``modelexpress_rl/refit/reshard/cuda_pool.py`` for the hazard and the CUDA
+        implementation). False means the default allocator is already suitable.
+        """
         ...

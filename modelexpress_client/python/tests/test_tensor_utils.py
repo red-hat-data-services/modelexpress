@@ -5,17 +5,21 @@
 
 import types
 
+import pytest
 import torch
 import torch.nn as nn
 
+from modelexpress import tensor_utils
 from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.tensor_utils import (
     _find_hidden_accel_tensors,
+    adopt_bare_tensors,
     adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
     safe_checksum,
     storage_view,
+    undiscovered_parameters,
 )
 
 
@@ -209,6 +213,27 @@ class TestAdoptHiddenTensors:
         assert any(name.endswith("_0") for name in buf_names)
 
 
+class TestAdoptBareTensors:
+    def test_promotes_bare_backend_tensors_only(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        module = nn.Module()
+        module.child = nn.Module()
+        module.child.W_UV = torch.randn(4)
+        module.param = nn.Parameter(torch.randn(4))
+        module.register_buffer("buf", torch.randn(4))
+        module.kv_cache = torch.randn(4)
+
+        assert adopt_bare_tensors(module, backend) == 1
+        assert set(dict(module.named_buffers())) == {"buf", "child.W_UV"}
+        assert set(dict(module.named_parameters())) == {"param"}
+        assert "kv_cache" not in dict(module.named_buffers())
+
+    def test_cpu_tensors_ignored(self):
+        module = nn.Module()
+        module.W_UV = torch.randn(4)
+        assert adopt_bare_tensors(module) == 0
+
+
 # ---------------------------------------------------------------------------
 # capture_tensor_attrs
 # ---------------------------------------------------------------------------
@@ -283,6 +308,31 @@ class TestSafeChecksum:
         t2 = torch.tensor([11, 19, 30], dtype=torch.uint8)
         assert safe_checksum(t1) != safe_checksum(t2)
 
+    def test_multi_dim_tensor(self):
+        t = torch.randn(4, 8)
+        assert not safe_checksum(t).startswith("err:")
+
+    def test_shape_independent(self):
+        t = torch.randn(2, 3, 5)
+        expected = safe_checksum(t.reshape(-1))
+        assert safe_checksum(t) == expected
+        assert safe_checksum(t.reshape(6, 5)) == expected
+
+    def test_chunk_size_independent(self, monkeypatch):
+        t = torch.randn(3, 17)
+        expected = safe_checksum(t)
+        monkeypatch.setattr(tensor_utils, "_CHECKSUM_CHUNK_BYTES", 7)
+        assert safe_checksum(t) == expected
+
+    def test_matches_unchunked_definition(self, monkeypatch):
+        monkeypatch.setattr(tensor_utils, "_CHECKSUM_CHUNK_BYTES", 5)
+        t = torch.arange(13, dtype=torch.uint8) * 19
+        expected = sum(
+            (b * ((i * 2654435761 + 1) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            for i, b in enumerate(t.tolist())
+        ) & 0xFFFFFFFF
+        assert safe_checksum(t) == format(expected, "08x")
+
 
 # ---------------------------------------------------------------------------
 # storage_view
@@ -306,6 +356,48 @@ class TestStorageView:
         view = base.T  # non-contiguous
         sv = storage_view(view)
         assert sv.numel() == base.numel() * base.element_size()
+
+
+# ---------------------------------------------------------------------------
+# undiscovered_parameters
+# ---------------------------------------------------------------------------
+
+
+class TestUndiscoveredParameters:
+    def test_lists_non_empty_parameters_outside_accelerator(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_accel = nn.Parameter(torch.empty(4, device="meta"))
+        model.on_host = nn.Parameter(torch.empty(4))
+        model.empty_on_host = nn.Parameter(torch.empty(0))
+        model.register_buffer("host_buffer", torch.empty(4))
+        assert undiscovered_parameters(model, backend) == ["on_host"]
+
+    def test_empty_when_all_parameters_on_accelerator(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        assert undiscovered_parameters(nn.Linear(4, 4), backend) == []
+
+    @pytest.mark.parametrize(
+        ("include_host_parameters", "expected"),
+        [(False, ["on_host", "on_meta"]), (True, ["on_meta"])],
+    )
+    def test_host_parameters_count_as_transferred_only_when_discovered(
+        self, mock_accelerator_backend_cls, include_host_parameters, expected
+    ):
+        backend = mock_accelerator_backend_cls()
+        model = nn.Module()
+        model.on_host = nn.Parameter(torch.empty(4))
+        model.on_meta = nn.Parameter(torch.empty(4, device="meta"))
+        assert (
+            undiscovered_parameters(
+                model, backend, include_host_parameters=include_host_parameters
+            )
+            == expected
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +432,54 @@ class TestCollectModuleTensors:
         tensors = collect_module_tensors(model, backend)
 
         assert set(tensors) == {"a", "b"}
+
+    @pytest.mark.parametrize("include_host_parameters", [False, True])
+    def test_host_parameters_only_when_requested(
+        self, mock_accelerator_backend_cls, include_host_parameters
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_accel = nn.Parameter(torch.empty(4, device="meta"))
+        model.on_host = nn.Parameter(torch.zeros(4))
+        model.register_buffer("host_buffer", torch.zeros(4))
+
+        tensors = collect_module_tensors(
+            model, backend, include_host_parameters=include_host_parameters
+        )
+
+        expected = {"on_accel", "on_host"} if include_host_parameters else {"on_accel"}
+        assert set(tensors) == expected
+
+    def test_host_parameter_overlapping_local_host_state_raises(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_host = nn.Parameter(torch.zeros(4))
+
+        with pytest.raises(ValueError, match="overlaps local runtime state"):
+            collect_module_tensors(
+                model,
+                backend,
+                preserve_local=[model.on_host.data],
+                include_host_parameters=True,
+            )
+
+    def test_host_parameter_beside_unrelated_local_host_state_is_collected(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_host = nn.Parameter(torch.zeros(4))
+
+        tensors = collect_module_tensors(
+            model,
+            backend,
+            preserve_local=[torch.zeros(4)],
+            include_host_parameters=True,
+        )
+
+        assert set(tensors) == {"on_host"}
 
     def test_non_contiguous_registered_as_storage(self, mock_accelerator_backend_cls):
         backend = mock_accelerator_backend_cls(torch_device_type="cpu")

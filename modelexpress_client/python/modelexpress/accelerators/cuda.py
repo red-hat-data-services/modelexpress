@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
+from .. import p2p_pb2
 from .base import NIXL_ACCELERATOR_MEM_TYPE
 
 
@@ -49,6 +50,13 @@ class CudaAcceleratorBackend:
     def is_accel_tensor(self, tensor: torch.Tensor) -> bool:
         return bool(tensor.is_cuda)
 
+    def tensor_mem_type(self, tensor: torch.Tensor) -> int:
+        if self.is_accel_tensor(tensor):
+            return p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
+        if tensor.device.type == "cpu":
+            return p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        raise ValueError(f"Cannot register a tensor on {tensor.device} for transfer")
+
     def supports_rdma_p2p(self) -> bool:
         return True
 
@@ -59,4 +67,7 @@ class CudaAcceleratorBackend:
         return True
 
     def supports_gds(self) -> bool:
+        return True
+
+    def requires_classic_alloc_pool(self) -> bool:
         return True

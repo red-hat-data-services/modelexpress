@@ -12,14 +12,22 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
-from modelexpress import nixl_transfer
-from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
+from modelexpress import nixl_transfer, p2p_pb2
+from modelexpress.accelerators import CudaAcceleratorBackend, NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.nixl_transfer import (
     _arena_single_mr_forced,
     NixlTransferManager,
     _pool_reg_enabled,
+    _spanning_descriptors,
 )
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
+
+
+class _StandInCudaBackend(CudaAcceleratorBackend):
+    """CUDA backend for CPU tensors standing in for GPU tensors."""
+
+    def is_accel_tensor(self, tensor: torch.Tensor) -> bool:
+        return True
 
 
 def _desc(name: str, addr: int, size: int) -> TensorDescriptor:
@@ -88,9 +96,10 @@ def fake_driver(monkeypatch):
 
 
 class TestPoolRegEnabled:
-    def test_default_is_off(self, monkeypatch):
+    def test_default_is_on(self, monkeypatch):
         monkeypatch.delenv("MX_POOL_REG", raising=False)
-        assert _pool_reg_enabled() is False
+        monkeypatch.delenv("MX_VMM_ARENA", raising=False)
+        assert _pool_reg_enabled() is True
 
     def test_explicit_zero_is_off(self, monkeypatch):
         monkeypatch.setenv("MX_POOL_REG", "0")
@@ -179,6 +188,12 @@ class TestFindCudaAllocations:
         result = NixlTransferManager._find_cuda_allocations(descriptors)
         assert result == [(0x1000, 0x1000), (0x2000, 0x1000)]
 
+    def test_tensor_past_allocation_end_raises(self, fake_driver):
+        # One VA range backed by two mappings reads as two allocations.
+        fake_driver([(0x1000, 0x1000), (0x2000, 0x1000)])
+        with pytest.raises(RuntimeError, match="'w' at 0x1f00 .* extends past"):
+            NixlTransferManager._find_cuda_allocations([_desc("w", 0x1F00, 0x200)])
+
     def test_driver_error_raises_runtime_error(self, fake_driver):
         from cuda.bindings import driver
 
@@ -196,9 +211,26 @@ class TestFindCudaAllocations:
             NixlTransferManager._find_cuda_allocations([_desc("w_named", 0x1000, 64)])
 
 
+class TestSpanningDescriptors:
+    def test_tensors_inside_allocations_are_not_reported(self):
+        allocations = [(0x1000, 0x1000), (0x2000, 0x1000)]
+        descriptors = [_desc("w0", 0x1000, 0x1000), _desc("w1", 0x2800, 0x800)]
+        assert _spanning_descriptors(descriptors, allocations) == []
+
+    def test_tensor_past_allocation_end_is_reported_with_its_allocation(self):
+        allocations = [(0x1000, 0x1000), (0x2000, 0x1000)]
+        inside = _desc("inside", 0x1000, 0x100)
+        spanning = _desc("spanning", 0x1f00, 0x200)
+        assert _spanning_descriptors([inside, spanning], allocations) == [
+            (spanning, 0x1000, 0x1000)
+        ]
+
+
 class TestRawDescriptorMemType:
     def _make_manager(self) -> NixlTransferManager:
-        mgr = NixlTransferManager(agent_name="test", device_id=0)
+        mgr = NixlTransferManager(
+            agent_name="test", device_id=0, accelerator_backend=_StandInCudaBackend()
+        )
         mgr._agent = MagicMock()
         mgr._agent.get_agent_metadata.return_value = b"metadata"
         return mgr
@@ -217,6 +249,45 @@ class TestRawDescriptorMemType:
             mem_type=NIXL_ACCELERATOR_MEM_TYPE,
             backends=["UCX"],
         )
+
+    def test_pool_registration_keeps_allocations_when_tensors_fit(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        backing = torch.zeros(8, dtype=torch.float32)
+        first = MagicMock(wraps=backing[:4])
+        first.is_cuda = True
+        second = MagicMock(wraps=backing[4:])
+        second.is_cuda = True
+        base = backing.data_ptr()
+        mgr = self._make_manager()
+        # Each tensor ends exactly at the end of its own allocation.
+        mgr._find_cuda_allocations = MagicMock(
+            return_value=[(base, 16), (base + 16, 16)]
+        )
+        mgr.register_tensors({"a": first, "b": second})
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(base, 16, 0, ""), (base + 16, 16, 0, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+
+    def test_pool_registration_rejects_tensor_spanning_allocations(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        backing = torch.zeros(4, dtype=torch.float32)
+        tensor = MagicMock(wraps=backing)
+        tensor.is_cuda = True
+        base = backing.data_ptr()
+        mgr = self._make_manager()
+        # One VA range backed by two separately mapped segments.
+        mgr._find_cuda_allocations = MagicMock(return_value=[(base, 8), (base + 8, 8)])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            mgr.register_tensors({"workspace": tensor})
+
+        message = str(exc_info.value)
+        assert "First: workspace" in message
+        assert f"[0x{base:x}, 0x{base + 8:x})" in message
+        mgr._agent.register_memory.assert_not_called()
 
     def test_draft_view_inside_registered_pool_reuses_main_registration(
         self, monkeypatch
@@ -240,13 +311,18 @@ class TestRawDescriptorMemType:
     def test_host_sources_bypass_cuda_pool_discovery(self, monkeypatch):
         monkeypatch.setenv("MX_POOL_REG", "1")
         tensor = torch.zeros(4, dtype=torch.float32)
-        mgr = self._make_manager()
+        mgr = NixlTransferManager(agent_name="test", device_id=3)
+        mgr._agent = MagicMock()
+        mgr._agent.get_agent_metadata.return_value = b"metadata"
         mgr._find_cuda_allocations = MagicMock(
             side_effect=AssertionError("CPU address")
         )
         assert mgr.register_tensors({"w": tensor}) == b"metadata"
         mgr._find_cuda_allocations.assert_not_called()
-        mgr._agent.register_memory.assert_called_once_with([tensor], backends=["UCX"])
+        mgr._agent.register_memory.assert_called_once_with(
+            [(tensor.data_ptr(), 16, 0, "")], mem_type="DRAM", backends=["UCX"]
+        )
+        assert mgr.tensor_descriptors[0].device_id == 0
 
     def test_null_address_tensor_stays_in_manifest_but_is_not_registered(
         self, monkeypatch
@@ -561,6 +637,262 @@ class TestRawDescriptorMemType:
         on_transfer_start.assert_not_called()
 
 
+class TestHostMemoryRegistration:
+    @staticmethod
+    def _make_manager() -> NixlTransferManager:
+        mgr = NixlTransferManager(agent_name="test", device_id=3)
+        mgr._agent = MagicMock()
+        mgr._agent.get_agent_metadata.return_value = b"metadata"
+        return mgr
+
+    @staticmethod
+    def _gpu_stand_in(numel: int = 4) -> MagicMock:
+        tensor = MagicMock(wraps=torch.zeros(numel, dtype=torch.float32))
+        tensor.is_cuda = True
+        tensor.dtype = torch.float32
+        return tensor
+
+    @staticmethod
+    def _source(name: str, tensor, mem_type: int) -> TensorDescriptor:
+        host = mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        return TensorDescriptor(
+            name=name,
+            addr=0x9000 if host else 0x1000,
+            size=tensor.numel() * tensor.element_size(),
+            device_id=0 if host else 5,
+            dtype=str(torch.float32),
+            mem_type=mem_type,
+        )
+
+    @staticmethod
+    def _receiving(monkeypatch, mgr: NixlTransferManager) -> None:
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *a, **k: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", MagicMock())
+        mgr._agent.check_xfer_state.return_value = "DONE"
+
+    def test_receive_reads_host_source_into_gpu_tensor(self, monkeypatch):
+        local = self._gpu_stand_in()
+        mgr = self._make_manager()
+        self._receiving(monkeypatch, mgr)
+        mgr._tensors = {"w": local}
+        source = self._source("w", local, p2p_pb2.TENSOR_MEMORY_TYPE_DRAM)
+
+        mgr.receive_from_source(
+            source_metadata=b"", source_tensors=[source], remote_agent_name="source"
+        )
+
+        assert mgr._agent.prep_xfer_dlist.call_args_list == [
+            call(
+                agent_name="source",
+                xfer_list=[(0x9000, 16, 0)],
+                mem_type="DRAM",
+                backends=["UCX"],
+            ),
+            call(
+                agent_name="",
+                xfer_list=[(local.data_ptr(), 16, 3)],
+                mem_type="VRAM",
+                backends=["UCX"],
+            ),
+        ]
+
+    def test_receive_issues_one_transfer_per_memory_type_pair(self, monkeypatch):
+        gpu = self._gpu_stand_in()
+        host = torch.zeros(2, dtype=torch.float32)
+        mgr = self._make_manager()
+        self._receiving(monkeypatch, mgr)
+        mgr._tensors = {"gpu": gpu, "host": host}
+        mgr._agent.make_prepped_xfer.side_effect = ["vram-handle", "dram-handle"]
+
+        result = mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[
+                self._source("gpu", gpu, p2p_pb2.TENSOR_MEMORY_TYPE_VRAM),
+                self._source("host", host, p2p_pb2.TENSOR_MEMORY_TYPE_DRAM),
+            ],
+            remote_agent_name="source",
+        )
+
+        assert result[:2] == (24, 2)
+        assert [c.kwargs["mem_type"] for c in mgr._agent.prep_xfer_dlist.call_args_list] == [
+            "VRAM", "VRAM", "DRAM", "DRAM",
+        ]
+        assert mgr._agent.prep_xfer_dlist.call_args_list[3].kwargs["xfer_list"] == [
+            (host.data_ptr(), 8, 0)
+        ]
+        assert mgr._agent.transfer.call_args_list == [
+            call("vram-handle"),
+            call("dram-handle"),
+        ]
+        assert mgr._agent.release_xfer_handle.call_args_list == [
+            call("vram-handle"),
+            call("dram-handle"),
+        ]
+        torch.cuda.synchronize.assert_called_once_with(3)
+
+    def test_receive_rejects_unknown_source_memory_type(self, monkeypatch):
+        local = self._gpu_stand_in()
+        mgr = self._make_manager()
+        self._receiving(monkeypatch, mgr)
+        mgr._tensors = {"w": local}
+        outcomes = []
+        monkeypatch.setattr(
+            nixl_transfer.transfer_metrics, "record_nixl_receive", outcomes.append
+        )
+        source = self._source("w", local, p2p_pb2.TENSOR_MEMORY_TYPE_VRAM)
+        source.mem_type = 7
+
+        with pytest.raises(ManifestMismatchError, match="unknown memory type 7"):
+            mgr.receive_from_source(
+                source_metadata=b"", source_tensors=[source], remote_agent_name="source"
+            )
+
+        assert outcomes == ["rejected"]
+        mgr._agent.prep_xfer_dlist.assert_not_called()
+
+    def test_receive_prepares_every_group_before_any_transfer(self, monkeypatch):
+        gpu = self._gpu_stand_in()
+        host = torch.zeros(2, dtype=torch.float32)
+        mgr = self._make_manager()
+        self._receiving(monkeypatch, mgr)
+        mgr._tensors = {"gpu": gpu, "host": host}
+        mgr._agent.prep_xfer_dlist.side_effect = [
+            "src", "dst", RuntimeError("second group"),
+        ]
+        mgr._agent.make_prepped_xfer.return_value = "vram-handle"
+        on_transfer_start = MagicMock()
+
+        with pytest.raises(RuntimeError, match="second group"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    self._source("gpu", gpu, p2p_pb2.TENSOR_MEMORY_TYPE_VRAM),
+                    self._source("host", host, p2p_pb2.TENSOR_MEMORY_TYPE_DRAM),
+                ],
+                remote_agent_name="source",
+                on_transfer_start=on_transfer_start,
+            )
+
+        on_transfer_start.assert_not_called()
+        mgr._agent.transfer.assert_not_called()
+        mgr._agent.release_xfer_handle.assert_called_once_with("vram-handle")
+
+    def test_receive_release_failure_keeps_releasing_and_original_error(
+        self, monkeypatch
+    ):
+        gpu = self._gpu_stand_in()
+        host = torch.zeros(2, dtype=torch.float32)
+        mgr = self._make_manager()
+        self._receiving(monkeypatch, mgr)
+        mgr._tensors = {"gpu": gpu, "host": host}
+        mgr._agent.make_prepped_xfer.side_effect = ["vram-handle", "dram-handle"]
+        mgr._agent.check_xfer_state.return_value = "ERR"
+        mgr._agent.release_xfer_handle.side_effect = [RuntimeError("busy"), None]
+
+        with pytest.raises(RuntimeError, match="Transfer failed with status ERR"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    self._source("gpu", gpu, p2p_pb2.TENSOR_MEMORY_TYPE_VRAM),
+                    self._source("host", host, p2p_pb2.TENSOR_MEMORY_TYPE_DRAM),
+                ],
+                remote_agent_name="source",
+            )
+
+        assert mgr._agent.release_xfer_handle.call_args_list == [
+            call("vram-handle"),
+            call("dram-handle"),
+        ]
+
+    def test_descriptors_record_memory_type_and_host_device(self):
+        mgr = self._make_manager()
+        descriptors = mgr._build_tensor_descriptors(
+            {"host": torch.zeros(4), "accel": self._gpu_stand_in()}
+        )
+        assert [(d.mem_type, d.device_id) for d in descriptors] == [
+            (p2p_pb2.TENSOR_MEMORY_TYPE_DRAM, 0),
+            (p2p_pb2.TENSOR_MEMORY_TYPE_VRAM, 3),
+        ]
+
+    def test_dram_registration_rejects_accelerator_descriptors(self):
+        mgr = self._make_manager()
+        (descriptor,) = mgr._build_tensor_descriptors({"accel": self._gpu_stand_in()})
+
+        with pytest.raises(ValueError, match="accel"):
+            mgr._register_dram_descriptors([descriptor])
+        mgr._agent.register_memory.assert_not_called()
+
+    def test_host_tensors_register_beside_gpu_pool(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        gpu = self._gpu_stand_in()
+        host = torch.zeros(2, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr._find_cuda_allocations = MagicMock(return_value=[(gpu.data_ptr(), 16)])
+
+        assert mgr.register_tensors({"gpu": gpu, "host": host}) == b"metadata"
+
+        assert mgr._agent.register_memory.call_args_list == [
+            call([(gpu.data_ptr(), 16, 3, "")], mem_type="VRAM", backends=["UCX"]),
+            call([(host.data_ptr(), 8, 0, "")], mem_type="DRAM", backends=["UCX"]),
+        ]
+        assert (host.data_ptr(), host.data_ptr() + 8) in mgr._base_registration_ranges
+
+    def test_arena_keeps_single_mr_beside_host_tensors(self):
+        gpu = self._gpu_stand_in()
+        host = torch.zeros(2, dtype=torch.float32)
+
+        class FakeArena:
+            live_allocation_count = 1
+
+            def registered_range(self):
+                return gpu.data_ptr(), 16
+
+        mgr = self._make_manager()
+        assert mgr.register_arena(FakeArena(), {"gpu": gpu, "host": host}) == b"metadata"
+
+        assert mgr._agent.register_memory.call_args_list == [
+            call([(gpu.data_ptr(), 16, 3, "")], mem_type="VRAM", backends=["UCX"]),
+            call([(host.data_ptr(), 8, 0, "")], mem_type="DRAM", backends=["UCX"]),
+        ]
+
+    def test_appended_host_tensor_registers_and_deregisters_as_dram(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "0")
+        gpu = self._gpu_stand_in()
+        host = torch.zeros(2, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr.register_tensors({"gpu": gpu})
+        mgr._agent.register_memory.reset_mock()
+        handle = MagicMock()
+        mgr._agent.register_memory.return_value = handle
+
+        mgr.register_additional_tensors({"draft.host": host})
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(host.data_ptr(), 8, 0, "")], mem_type="DRAM", backends=["UCX"]
+        )
+        mgr.deregister_tensors(["draft.host"])
+        mgr._agent.deregister_memory.assert_called_once_with(handle)
+        assert handle not in mgr._registered_memory
+
+    def test_appended_rollback_releases_every_new_registration(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "0")
+        mgr = self._make_manager()
+        mgr.register_tensors({"gpu": self._gpu_stand_in()})
+        vram_handle, dram_handle = MagicMock(), MagicMock()
+        mgr._agent.register_memory.side_effect = [vram_handle, dram_handle]
+        mgr._agent.get_agent_metadata.side_effect = RuntimeError("metadata")
+
+        with pytest.raises(RuntimeError, match="metadata"):
+            mgr.register_additional_tensors(
+                {"draft.gpu": self._gpu_stand_in(8), "draft.host": torch.zeros(2)}
+            )
+
+        assert mgr._agent.deregister_memory.call_args_list == [
+            call(vram_handle),
+            call(dram_handle),
+        ]
+
+
 class TestReceiveFromSourceManifestValidation:
     """receive_from_source must reject size/dtype mismatches before building
     RDMA descriptors. Catching these here prevents silent memory corruption
@@ -749,49 +1081,50 @@ class TestReceiveFromSourceManifestValidation:
                 remote_agent_name="dummy",
             )
 
-    def test_unmatched_name_skips_silently(self, monkeypatch):
-        # No matching local tensor for the source's "w". Loop should `continue`
-        # without raising; the caller decides whether the empty match list is
-        # an error. We just verify the validation doesn't fire spuriously.
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_local_only_tensor_raises_in_every_mode(self, monkeypatch, strict):
+        # "lm_head" would keep its dummy values while RDMA reports success, so a
+        # same-family receive fails closed too.
+        embed = torch.full((4,), 7.0)
+        lm_head = torch.full((4,), -1.0)
         mgr = self._make_manager(
-            monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
+            monkeypatch, {"embed": embed, "lm_head": lm_head}
         )
-        wrong_name = TensorDescriptor(
-            name="w",
-            addr=0x1000,
-            size=4,
-            device_id=0,
-            dtype="torch.float32",
-        )
-        # Empty match -> early-return (0, 0, 0.0); no exception.
-        result = mgr.receive_from_source(
-            source_metadata=b"",
-            source_tensors=[wrong_name],
-            remote_agent_name="dummy",
-        )
-        assert result == (0, 0, 0.0)
-
-    def test_unmatched_name_warns(self, monkeypatch, caplog):
-        # Unmatched names stay non-fatal but are surfaced: an unmatched local
-        # tensor keeps its init values.
-        mgr = self._make_manager(
-            monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
-        )
-        wrong_name = TensorDescriptor(
-            name="w",
-            addr=0x1000,
-            size=4,
-            device_id=0,
-            dtype="torch.float32",
-        )
-        with caplog.at_level(logging.WARNING, logger="modelexpress.nixl_transfer"):
+        with pytest.raises(
+            ManifestMismatchError,
+            match=r"1 local-only \(first: \['lm_head'\]\), 0 source-only",
+        ):
             mgr.receive_from_source(
                 source_metadata=b"",
-                source_tensors=[wrong_name],
+                source_tensors=[
+                    TensorDescriptor("embed", 0x1000, 16, 0, str(embed.dtype))
+                ],
+                remote_agent_name="dummy",
+                require_exact_match=strict,
+            )
+        mgr._agent.prep_xfer_dlist.assert_not_called()
+        assert torch.equal(lm_head, torch.full((4,), -1.0))
+
+    def test_source_only_tensor_warns_without_raising(self, monkeypatch, caplog):
+        # A source-only tensor leaves nothing on the target uninitialized.
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+        local = torch.zeros(1, dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"w": local})
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.make_prepped_xfer.return_value = "handle"
+        mgr._agent.check_xfer_state.return_value = "DONE"
+        with caplog.at_level(logging.WARNING, logger="modelexpress.nixl_transfer"):
+            result = mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor("w", 0x1000, 4, 0, "torch.float32"),
+                    TensorDescriptor("extra", 0x2000, 4, 0, "torch.float32"),
+                ],
                 remote_agent_name="dummy",
             )
+        assert result[:2] == (4, 1)
         assert any(
-            "1 local-only (first: ['x']), 1 source-only (first: ['w'])"
+            "1 tensors this target does not register (first: ['extra'])"
             in rec.getMessage()
             for rec in caplog.records
         )
@@ -814,13 +1147,47 @@ class TestReceiveFromSourceManifestValidation:
             device_id=0,
             dtype="torch.float32",
         )
-        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+        with pytest.raises(ManifestMismatchError, match="Tensor name mismatch"):
             mgr.receive_from_source(
                 source_metadata=b"",
                 source_tensors=[src],
                 remote_agent_name="dummy",
                 require_exact_match=True,
             )
+
+    @pytest.mark.parametrize("missing_on", ["receiver", "source"])
+    def test_sglang_rejects_missing_derived_tensor(self, monkeypatch, missing_on):
+        from types import SimpleNamespace
+        from modelexpress.engines.sglang.adapter import SglangAdapter
+
+        adapter = SglangAdapter(
+            SimpleNamespace(), SimpleNamespace(),
+            SimpleNamespace(device="cuda:0", gpu_id=0),
+        )
+        local = {"proj.weight": torch.zeros(1)}
+        derived = "proj.weight_scale_inv_swizzled"
+        source = [TensorDescriptor(
+            name="proj.weight", addr=0x1000, size=4,
+            device_id=0, dtype="torch.float32",
+        )]
+        if missing_on == "receiver":
+            source.append(TensorDescriptor(
+                name=derived, addr=0x2000, size=4,
+                device_id=0, dtype="torch.float32",
+            ))
+        else:
+            local[derived] = torch.zeros(1)
+        mgr = self._make_manager(monkeypatch, local)
+        mgr._agent.check_xfer_state.return_value = "DONE"
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+        with pytest.raises(ManifestMismatchError, match="Tensor name mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"", source_tensors=source,
+                remote_agent_name="dummy",
+                require_exact_match=adapter.requires_exact_tensor_catalog(),
+            )
+        mgr._agent.prep_xfer_dlist.assert_not_called()
+        mgr._agent.make_prepped_xfer.assert_not_called()
 
     def test_hetero_source_only_name_mismatch_raises(self, monkeypatch):
         # Source names a tensor the target never registered.
@@ -843,7 +1210,7 @@ class TestReceiveFromSourceManifestValidation:
                 dtype="torch.float32",
             ),
         ]
-        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+        with pytest.raises(ManifestMismatchError, match="Tensor name mismatch"):
             mgr.receive_from_source(
                 source_metadata=b"",
                 source_tensors=src,
@@ -864,7 +1231,7 @@ class TestReceiveFromSourceManifestValidation:
             device_id=0,
             dtype="torch.float32",
         )
-        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+        with pytest.raises(ManifestMismatchError, match="Tensor name mismatch"):
             mgr.receive_from_source(
                 source_metadata=b"",
                 source_tensors=[src],
@@ -876,8 +1243,8 @@ class TestReceiveFromSourceManifestValidation:
         # Identical name sets must clear the name-mismatch guard: with only "w"
         # on both sides and require_exact_match=True, execution proceeds past the
         # guard to the size check, which here fails on a deliberate size skew.
-        # A ManifestMismatchError about "heterogeneous transfer" would mean the
-        # name guard fired spuriously; a "size mismatch" proves it did not.
+        # A "Tensor name mismatch" error would mean the name guard fired
+        # spuriously; a "size mismatch" proves it did not.
         local = torch.zeros(10, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         src = TensorDescriptor(
@@ -965,7 +1332,9 @@ class TestMultiAllocationArena:
 
     @staticmethod
     def _make_manager() -> NixlTransferManager:
-        mgr = NixlTransferManager(agent_name="test", device_id=0)
+        mgr = NixlTransferManager(
+            agent_name="test", device_id=0, accelerator_backend=_StandInCudaBackend()
+        )
         mgr._agent = MagicMock()
         mgr._agent.get_agent_metadata.return_value = b"metadata"
         return mgr
@@ -1074,6 +1443,129 @@ class _MetricsSpy:
         return lambda *args, **kwargs: None
 
 
+class TestAddresslessTensorTransfers:
+    def _manager(self, monkeypatch, tensors):
+        monkeypatch.setenv("MX_POOL_REG", "0")
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *a, **k: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+        manager = NixlTransferManager(
+            agent_name="test", device_id=0, accelerator_backend=_StandInCudaBackend()
+        )
+        manager._agent = MagicMock()
+        manager._agent.get_agent_metadata.return_value = b"metadata"
+        manager.register_tensors(tensors)
+        manager._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        manager._agent.make_prepped_xfer.return_value = "handle"
+        manager._agent.check_xfer_state.return_value = "DONE"
+        return manager
+
+    def _outcomes(self, monkeypatch):
+        outcomes = []
+        monkeypatch.setattr(
+            nixl_transfer.transfer_metrics, "record_nixl_receive", outcomes.append
+        )
+        return outcomes
+
+    @pytest.mark.parametrize("strict", [False, True])
+    @pytest.mark.parametrize("mixed", [False, True])
+    def test_unallocated_source_is_rejected_for_allocated_target(
+        self, monkeypatch, strict, mixed
+    ):
+        source_tensors = {"w": torch.empty(1, device="meta")}
+        local_tensors = {"w": torch.full((1,), 7.0)}
+        if mixed:
+            source_tensors["live"] = torch.ones(2)
+            local_tensors["live"] = torch.zeros(2)
+        source = self._manager(monkeypatch, source_tensors)
+        target = self._manager(monkeypatch, local_tensors)
+        outcomes = self._outcomes(monkeypatch)
+
+        with pytest.raises(ManifestMismatchError, match="w.*source.*address"):
+            target.receive_from_source(
+                source_metadata=b"metadata",
+                source_tensors=source.tensor_descriptors,
+                remote_agent_name="source",
+                require_exact_match=strict,
+            )
+
+        target._agent.prep_xfer_dlist.assert_not_called()
+        assert outcomes == ["rejected"]
+        assert local_tensors["w"].item() == 7.0
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_unallocated_destination_is_rejected(self, monkeypatch, strict):
+        source = self._manager(monkeypatch, {"w": torch.ones(1)})
+        target = self._manager(monkeypatch, {"w": torch.empty(1, device="meta")})
+        outcomes = self._outcomes(monkeypatch)
+
+        with pytest.raises(ManifestMismatchError, match="w.*local.*address"):
+            target.receive_from_source(
+                source_metadata=b"metadata",
+                source_tensors=source.tensor_descriptors,
+                remote_agent_name="source",
+                require_exact_match=strict,
+            )
+
+        target._agent.prep_xfer_dlist.assert_not_called()
+        assert outcomes == ["rejected"]
+
+    def test_registered_empty_tensors_still_complete_in_strict_mode(self, monkeypatch):
+        tensors = {"a": torch.empty(0), "b": torch.empty(0, dtype=torch.int32)}
+        source = self._manager(monkeypatch, tensors)
+        target = self._manager(monkeypatch, tensors)
+        outcomes = self._outcomes(monkeypatch)
+
+        assert target.receive_from_source(
+            source_metadata=b"metadata",
+            source_tensors=source.tensor_descriptors,
+            remote_agent_name="source",
+            require_exact_match=True,
+        ) == (0, 2, 0.0)
+
+        target._agent.prep_xfer_dlist.assert_not_called()
+        assert outcomes == ["complete"]
+
+    @pytest.mark.parametrize("kind", ["empty", "meta", "noncontiguous_meta"])
+    def test_appended_no_payload_tensor_needs_no_registration(self, monkeypatch, kind):
+        tensors = {
+            "empty": torch.empty(0),
+            "meta": torch.empty(1, device="meta"),
+            "noncontiguous_meta": torch.empty((2, 3), device="meta").T,
+        }
+        tensor = tensors[kind]
+        target = self._manager(monkeypatch, {"main": torch.ones(1)})
+        target._agent.register_memory.reset_mock()
+
+        assert target.register_additional_tensors({"draft": tensor}) == b"metadata"
+
+        target._agent.register_memory.assert_not_called()
+        assert target._tensors["draft"] is tensor
+        assert target.tensor_descriptors[-1] == TensorDescriptor(
+            name="draft",
+            addr=tensor.data_ptr(),
+            size=tensor.numel() * tensor.element_size(),
+            device_id=0,
+            dtype=str(tensor.dtype),
+        )
+        assert target._appended_registrations["draft"] is None
+        target.deregister_tensors(["draft"])
+        target._agent.deregister_memory.assert_not_called()
+        assert list(target._tensors) == ["main"]
+
+    def test_appending_mixed_tensors_registers_only_allocated_storage(self, monkeypatch):
+        target = self._manager(monkeypatch, {"main": torch.ones(1)})
+        target._agent.register_memory.reset_mock()
+        live = torch.ones(2)
+
+        target.register_additional_tensors(
+            {"unallocated": torch.empty(1, device="meta"), "live": live}
+        )
+
+        target._agent.register_memory.assert_called_once_with([live], backends=["UCX"])
+        assert target._appended_registrations["unallocated"] is None
+        assert list(target._tensors) == ["main", "unallocated", "live"]
+
+
 class TestReceiveOutcomeLabelsAtTheCallSite:
     """Pins which label each ``record_nixl_*`` call site in the receive path picks.
 
@@ -1132,17 +1624,20 @@ class TestReceiveOutcomeLabelsAtTheCallSite:
         assert spy.receives == ["complete"]
         assert spy.errors == []
 
-    def test_a_name_diff_counts_one_partial_and_not_a_complete(self, monkeypatch):
-        # A local-only tensor keeps its dummy values while the transfer still
-        # returns success, which is the whole reason `partial` exists.
+    def test_a_source_only_diff_counts_one_partial_and_not_a_complete(
+        self, monkeypatch
+    ):
         local = torch.zeros(4, dtype=torch.float32)
         spy = self._spy(monkeypatch)
-        mgr = self._manager(monkeypatch, {"w": local, "unmatched": local})
+        mgr = self._manager(monkeypatch, {"w": local})
         self._arm(mgr, "DONE")
 
         mgr.receive_from_source(
             source_metadata=b"",
-            source_tensors=[self._matching("w", local)],
+            source_tensors=[
+                self._matching("w", local),
+                self._matching("unmatched", local),
+            ],
             remote_agent_name="source",
         )
 
@@ -1153,7 +1648,7 @@ class TestReceiveOutcomeLabelsAtTheCallSite:
         # Returns (0, 0, 0.0) -- success to the caller, nothing moved on the wire.
         local = torch.zeros(4, dtype=torch.float32)
         spy = self._spy(monkeypatch)
-        mgr = self._manager(monkeypatch, {"x": local})
+        mgr = self._manager(monkeypatch, {})
 
         assert mgr.receive_from_source(
             source_metadata=b"",

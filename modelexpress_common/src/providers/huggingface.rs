@@ -212,12 +212,13 @@ impl ProviderCache for HuggingFaceProviderCache {
                 continue;
             }
 
-            models.push(ModelInfo {
-                provider: ModelProvider::HuggingFace,
-                name: Self::folder_name_to_model_id(folder_name),
-                size: directory_size(&path)?,
+            let size = directory_size(&path);
+            models.push(ModelInfo::measured(
+                ModelProvider::HuggingFace,
+                Self::folder_name_to_model_id(folder_name),
                 path,
-            });
+                size,
+            ));
         }
 
         Ok(models)
@@ -953,7 +954,6 @@ impl ModelProviderTrait for HuggingFaceProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, acquire_env_mutex};

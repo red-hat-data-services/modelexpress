@@ -48,6 +48,102 @@ def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cl
     )
 
 
+@pytest.mark.parametrize("layout", ["bf16", "bf16_bias", "prefused", "non_dsa", "bf16_scale"])
+def test_apply_weight_iter_leaves_non_fp8_indexer_weights_untouched(layout):
+    """Ordinary indexer layouts retain their original tensors without replay."""
+    prefix = "model.layers.0.self_attn.indexer"
+    weights = [(f"{prefix}.wk.weight", torch.ones(2, dtype=torch.bfloat16))]
+    if layout == "bf16_bias":
+        weights.append((f"{prefix}.wk.bias", torch.ones(2, dtype=torch.bfloat16)))
+    elif layout == "prefused":
+        weights = [(f"{prefix}.wk_weights_proj", torch.ones(2, dtype=torch.bfloat16))]
+    elif layout == "non_dsa":
+        weights = [("model.layers.0.self_attn.q_proj.weight", torch.ones(2))]
+    elif layout == "bf16_scale":
+        weights.append((f"{prefix}.wk.weight_scale_inv", torch.ones(1)))
+    loads = []
+    model = SimpleNamespace(load_weights=lambda items: loads.append(list(items)))
+    result = LoadResult(value=model, model=model)
+    adapter = object.__new__(VllmAdapter)
+
+    assert adapter.apply_weight_iter(result, iter(weights)) is result
+
+    assert len(loads) == 1
+    assert [name for name, _ in loads[0]] == [name for name, _ in weights]
+    assert loads[0][0][1] is weights[0][1]
+    if layout == "bf16_bias":
+        assert loads[0][1][1] is weights[1][1]
+
+
+@pytest.mark.parametrize("scale_name", ["weight_scale", "weight_scale_inv"])
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_apply_weight_iter_replays_owned_fp8_indexer_pair(scale_name, scale_first):
+    """Replay owns both tensors even when the stream reuses its read buffers."""
+    prefix = "model.layers.0.self_attn.indexer"
+    weight = torch.ones(2).to(torch.float8_e4m3fn)
+    scale = torch.full((1,), 2.0)
+    weights = [(f"{prefix}.wk.weight", weight), (f"{prefix}.wk.{scale_name}", scale)]
+    if scale_first:
+        weights.reverse()
+    weights.insert(1, ("lm_head.weight", torch.ones(2)))
+    bf16_name = "model.layers.1.self_attn.indexer.wk.weight"
+    bf16_weight = torch.ones(2, dtype=torch.bfloat16)
+    loads = []
+    pending = {prefix: object()}
+
+    def stream():
+        """Reuse each source buffer immediately after the consumer advances."""
+        for name, tensor in weights:
+            yield name, tensor
+            tensor.zero_()
+        yield bf16_name, bf16_weight
+
+    class WrappedIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model._pending_indexer_wk_fp8 = pending
+
+        def load_weights(self, items):
+            """The inner buffer must be clean before the first load and replay."""
+            assert not pending
+            loads.append(list(items))
+            if len(loads) == 1:
+                pending[prefix] = object()
+
+    model = WrappedIndexer()
+    result = LoadResult(value=model, model=model)
+    adapter = object.__new__(VllmAdapter)
+
+    assert adapter.apply_weight_iter(result, stream()) is result
+
+    assert len(loads) == 2
+    replay = dict(loads[1])
+    assert set(replay) == {name for name, _ in weights if name != "lm_head.weight"}
+    torch.testing.assert_close(replay[f"{prefix}.wk.weight"].float(), torch.ones(2))
+    torch.testing.assert_close(replay[f"{prefix}.wk.{scale_name}"], torch.full((1,), 2.0))
+    assert loads[0][-1][1] is bf16_weight
+    for name, original in weights:
+        if name == "lm_head.weight":
+            continue
+        assert replay[name] is not original
+        assert replay[name] is dict(loads[0])[name]
+
+
+def test_apply_weight_iter_rejects_fp8_indexer_weight_without_scale():
+    """An incomplete pair fails before a second loader call."""
+    name = "model.layers.0.self_attn.indexer.wk.weight"
+    weight = torch.ones(2).to(torch.float8_e4m3fn)
+    loads = []
+    model = SimpleNamespace(load_weights=lambda items: loads.append(list(items)))
+    adapter = object.__new__(VllmAdapter)
+
+    with pytest.raises(RuntimeError, match="stream lacks an FP8 indexer wk weight or scale"):
+        adapter.apply_weight_iter(LoadResult(value=model, model=model), iter([(name, weight)]))
+
+    assert len(loads) == 1
+
+
 def test_worker_rank_uses_torch_distributed_global_rank():
     config = _vllm_config(rank=2, tp_size=4, pp_size=2)
     device = torch.device("cuda", 0)
@@ -264,8 +360,26 @@ def test_before_rdma_receive_runs_layout_finalizers(monkeypatch):
     assert result.model is model
     assert events == [
         ("finalize", "model", "finalize_mega_moe_weights"),
+        ("finalize", "model", "finalize_mega_attn_weights"),
         ("process", torch.device("cpu")),
     ]
+
+
+def test_before_rdma_receive_permutes_mega_attn_before_quant_processing(monkeypatch):
+    """Mirrors vLLM: the model-level hook re-runs mega attn after quant processing."""
+
+    def process_weights_after_loading(model, model_config, target_device):
+        model.model.attn.quant_processed = True
+        model.process_weights_after_loading()
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _MegaAttnTopLevelModel()
+
+    adapter.before_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.model.attn.permutes == 1
+    assert model.model.attn._fused_layouts_ready
 
 
 def test_after_rdma_receive_runs_derived_weight_finalizers(monkeypatch):
@@ -815,6 +929,79 @@ def test_after_weight_iter_load_does_not_rerun_model_specific_finalizers(monkeyp
     assert events == [("process", torch.device("cpu"))]
 
 
+@pytest.mark.parametrize("online_quant", (True, False))
+@pytest.mark.parametrize(
+    "hook_name",
+    ("after_native_load", "after_weight_iter_load", "before_rdma_receive"),
+)
+def test_load_hooks_finalize_online_quant_before_postprocessing(
+    monkeypatch, hook_name, online_quant
+):
+    """Check that load hooks finalize layerwise loading only for online quant.
+
+    Online-quantized checkpoint hooks release the allocator cache before
+    finalization; other loads and RDMA target preparation leave it untouched.
+    """
+    events = []
+
+    def process_weights_after_loading(model, model_config, target_device):
+        if online_quant:
+            assert not model.weight.is_meta
+            torch.testing.assert_close(model.weight, torch.ones(2, 2))
+        events.append(("process", model, model_config, target_device))
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+
+    def has_online_quant(model):
+        return online_quant
+
+    def finalize(model, config):
+        assert model.weight.is_meta
+        model.weight = nn.Parameter(torch.ones(2, 2))
+        events.append(("layerwise", model, config))
+
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.base_loader"],
+        "_has_online_quant",
+        has_online_quant,
+    )
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.reload"],
+        "finalize_layerwise_processing",
+        finalize,
+    )
+
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.gc.collect",
+        lambda: events.append("gc"),
+    )
+    monkeypatch.setattr(
+        adapter.accelerator_backend,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.empty(2, 2, device="meta"))
+    result = LoadResult(value=model, model=model)
+    if hook_name == "before_rdma_receive":
+        monkeypatch.setattr(
+            adapter,
+            "_finalize_model_specific_weights",
+            lambda value, _names: events.append("model_specific") or value,
+        )
+
+    assert getattr(adapter, hook_name)(result) is result
+
+    expected = ["model_specific"] if hook_name == "before_rdma_receive" else []
+    if online_quant:
+        if hook_name != "before_rdma_receive":
+            expected.extend(("gc", "empty_cache"))
+        expected.append(("layerwise", model, adapter.model_config))
+    expected.append(("process", model, adapter.model_config, torch.device("cpu")))
+    assert events == expected
+
+
 def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
     fake_platforms = SimpleNamespace(
         current_platform=SimpleNamespace(
@@ -825,6 +1012,7 @@ def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
 
 
 def _stub_vllm_process_weights_after_loading(monkeypatch, process_fn) -> None:
+    """Install isolated vLLM loader stubs with a custom post-processing hook."""
     packages = [
         "vllm",
         "vllm.model_executor",
@@ -838,6 +1026,14 @@ def _stub_vllm_process_weights_after_loading(monkeypatch, process_fn) -> None:
     utils = ModuleType("vllm.model_executor.model_loader.utils")
     utils.process_weights_after_loading = process_fn
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
+
+    base_loader = ModuleType("vllm.model_executor.model_loader.base_loader")
+    base_loader._has_online_quant = lambda _model: False
+    monkeypatch.setitem(sys.modules, base_loader.__name__, base_loader)
+
+    reload_module = ModuleType("vllm.model_executor.model_loader.reload")
+    reload_module.finalize_layerwise_processing = lambda *_args: None
+    monkeypatch.setitem(sys.modules, reload_module.__name__, reload_module)
 
 
 def _stub_metadata_client(monkeypatch) -> None:
@@ -885,10 +1081,47 @@ class _MegaMoeModel(torch.nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         self.events.append(("finalize", "model", "finalize_mega_moe_weights"))
 
+    def finalize_mega_attn_weights(self) -> None:
+        self.events.append(("finalize", "model", "finalize_mega_attn_weights"))
+
     def finalize_mhc_broadcast_weights(self) -> None:
         self.events.append(
             ("finalize", "model", "finalize_mhc_broadcast_weights")
         )
+
+
+class _MegaAttnTopLevelModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = _MegaAttnModel()
+
+    def process_weights_after_loading(self) -> None:
+        self.model.finalize_mega_attn_weights()
+
+
+class _MegaAttnModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = _MegaAttnAttention()
+
+    def finalize_mega_attn_weights(self) -> None:
+        self.attn.finalize_loaded_weights()
+
+
+class _MegaAttnAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._fused_layouts_ready = False
+        self.quant_processed = False
+        self.permutes = 0
+
+    def finalize_loaded_weights(self) -> None:
+        if self._fused_layouts_ready:
+            return
+        if self.quant_processed:
+            raise RuntimeError("permutation ran after quant post-processing")
+        self.permutes += 1
+        self._fused_layouts_ready = True
 
 
 class _MegaMoeLayer(torch.nn.Module):
@@ -1487,7 +1720,7 @@ class TestTargetSharedDraftPrefixes:
         )
         monkeypatch.setattr(
             "modelexpress.engines.vllm.adapter.collect_module_tensors",
-            lambda *_args: {
+            lambda *_args, **_kwargs: {
                 "layers.0.shared_head.head.weight": model.layers[0].shared_head.head.weight
             },
         )
@@ -1500,6 +1733,20 @@ class TestTargetSharedDraftPrefixes:
         assert "layers.0.shared_head.head.weight" in adapter.discover_tensors(
             LoadResult(value=model, model=model)
         )
+
+
+def test_discovery_includes_host_parameters(mock_accelerator_backend_cls):
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="meta")
+    model = nn.Module()
+    model.attn = nn.Parameter(torch.empty(4, device="meta"))
+    model.engram = nn.Parameter(torch.zeros(4))
+
+    registered = adapter.discover_tensors(LoadResult(value=model, model=model))
+
+    assert adapter.discovers_host_parameters() is True
+    assert set(registered) == {"attn", "engram"}
+    assert registered["engram"].data_ptr() == model.engram.data_ptr()
 
 
 @pytest.mark.parametrize(
@@ -1533,3 +1780,183 @@ def test_discovery_keeps_exact_k3_collective_state_local(
     assert op.collective.peer_ptrs is pointers
     assert op.collective.flags is flags
     assert op.collective.workspace is workspace
+
+
+def test_apply_weight_iter_rejects_pairs_left_pending_after_replay():
+    """A loader that strands a complete pair after replay must fail explicitly."""
+    prefix = "model.layers.0.self_attn.indexer"
+    weights = [(f"{prefix}.wk.weight", torch.ones(2).to(torch.float8_e4m3fn)), (f"{prefix}.wk.weight_scale_inv", torch.ones(1))]
+    loads = []
+    def load(items):
+        """Strand a pair specifically during the second loader call."""
+        loads.append(list(items))
+        if len(loads) == 2:
+            model.model._pending_indexer_wk_fp8[prefix] = {"weight": object()}
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model._pending_indexer_wk_fp8 = {}
+    model.load_weights = load
+    adapter = object.__new__(VllmAdapter)
+    with pytest.raises(RuntimeError, match="pairs remain pending after the rewrite"):
+        adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
+    assert len(loads) == 2
+
+
+@pytest.mark.parametrize("has_draft", [True, False])
+def test_indexer_replay_scopes_mtp_completeness_validation(monkeypatch, has_draft):
+    """Only the partial replay may bypass draft-layer completeness validation."""
+    from contextlib import contextmanager
+    enabled = [True]
+    module = ModuleType("vllm.model_executor.model_loader.mtp_validation")
+    @contextmanager
+    def partial():
+        """Restore completeness validation after the partial replay exits."""
+        enabled[0] = False
+        try:
+            yield
+        finally:
+            enabled[0] = True
+    module.disable_mtp_completeness_check = partial
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    calls = []
+    def load(items):
+        """Reject missing draft layers whenever completeness validation is enabled."""
+        items = list(items)
+        calls.append(enabled[0])
+        if enabled[0] and not any(name.startswith("model.layers.1.") for name, _ in items):
+            raise ValueError("missing draft layers")
+    model = SimpleNamespace(load_weights=load)
+    prefix = "model.layers.0.self_attn.indexer.wk"
+    weights = [(prefix + ".weight", torch.ones(2).to(torch.float8_e4m3fn)), (prefix + ".weight_scale_inv", torch.ones(1))]
+    if has_draft:
+        weights.append(("model.layers.1.self_attn.indexer.wk.weight", torch.ones(2, dtype=torch.bfloat16)))
+    adapter = object.__new__(VllmAdapter)
+    if has_draft:
+        adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
+        assert calls == [True, False]
+    else:
+        with pytest.raises(ValueError, match="missing draft layers"):
+            adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
+        assert calls == [True]
+    assert enabled == [True]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real vLLM and CUDA")
+@pytest.mark.parametrize("scale_first", [False, True])
+@pytest.mark.parametrize("scale_layout", ["per_channel", "block"])
+def test_fp8_indexer_replay_preserves_vllm_fused_projection(monkeypatch, scale_first, scale_layout):
+    """Replay through vLLM's loader must preserve both shards of its fused projection."""
+    deepseek = pytest.importorskip("vllm.model_executor.models.deepseek_v2")
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(deepseek, "get_pp_missing_layer_names", lambda model: [])
+    monkeypatch.setattr(deepseek, "fused_moe_make_expert_params_mapping", lambda *args, **kwargs: [])
+    monkeypatch.setattr(deepseek, "get_spec_layer_idx_from_weight_name", lambda config, name: None)
+    with set_current_vllm_config(VllmConfig()), torch.device("cuda"):
+        projection = MergedColumnParallelLinear(
+            128, [128, 4], bias=False, params_dtype=torch.bfloat16, disable_tp=True,
+        )
+        projection.weight.data.fill_(-3)
+        prefix = "layers.0.self_attn.indexer"
+        fused_name = f"{prefix}.wk_weights_proj.weight"
+        snapshots = []
+        model = SimpleNamespace(
+            use_mha=False,
+            config=SimpleNamespace(n_routed_experts=1, n_shared_experts=0),
+            is_fused_shared_expert_enabled=False,
+            num_redundant_experts=0,
+            named_parameters=lambda: [(fused_name, projection.weight)],
+        )
+
+        def load_weights(items):
+            """Exercise vLLM's model loader and capture each resulting fused tensor."""
+            loaded = deepseek.DeepseekV2Model.load_weights(model, items)
+            assert fused_name in loaded
+            snapshots.append(projection.weight.detach().clone())
+
+        model.load_weights = load_weights
+        weight = (torch.arange(128 * 128).reshape(128, 128) % 8).to(torch.float8_e4m3fn)
+        scale = torch.full((128,) if scale_layout == "per_channel" else (1, 1), 2.0)
+        expected = (weight.float() * 2).to(torch.bfloat16)
+        weights = [(f"{prefix}.wk.weight", weight), (f"{prefix}.wk.weight_scale_inv", scale)]
+        if scale_first:
+            weights.reverse()
+        adapter = object.__new__(VllmAdapter)
+        adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
+
+        assert len(snapshots) == 2
+        torch.testing.assert_close(snapshots[0][:128], expected)
+        torch.testing.assert_close(snapshots[0][128:], torch.full((4, 128), -3, dtype=torch.bfloat16))
+        torch.testing.assert_close(snapshots[1], snapshots[0])
+        assert not model._pending_indexer_wk_fp8
+
+
+def test_vllm_context_supplies_artifact_readiness_callback(monkeypatch):
+    from modelexpress.engines.vllm import artifacts
+
+    _stub_metadata_client(monkeypatch)
+    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 0
+    config = _context_config(load_device="cuda:0")
+    config.load_config.model_loader_extra_config = {"modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health"}
+    config.parallel_config.master_addr = "head.internal"
+    monkeypatch.delenv("MX_ARTIFACT_READY_URL", raising=False)
+    monkeypatch.delenv("LWS_LEADER_ADDRESS", raising=False)
+    urls = []
+    monkeypatch.setattr(
+        artifacts._artifact_lifecycle,
+        "artifact_health_ready",
+        lambda url: urls.append(url) or True,
+    )
+
+    ctx = build_vllm_load_context(config, _model_config())
+    assert ctx.artifact_ready_fn()
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "https://custom.internal:9443/ready")
+    assert ctx.artifact_ready_fn()
+    assert urls == [
+        "http://head.internal:9007/health",
+        "https://custom.internal:9443/ready",
+    ]
+
+
+def test_adapter_native_loaders_do_not_receive_mx_readiness_options():
+    config = _context_config(load_device="cpu")
+    config.load_config.model_loader_extra_config = {
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health",
+        "num_threads": 4,
+    }
+    adapter = VllmAdapter(config, _model_config())
+    assert adapter.load_config.model_loader_extra_config == {"num_threads": 4}
+    assert config.load_config.model_loader_extra_config == {
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health",
+        "num_threads": 4,
+    }
+
+
+@pytest.mark.parametrize("fmt, expected", [(None, "auto"), ("safetensors", "safetensors")])
+def test_load_via_native_uses_cold_start_format(monkeypatch, fmt, expected):
+    """The disk fallback builds DefaultModelLoader with MX_COLD_START_FORMAT, not a fixed auto."""
+    if fmt is None:
+        monkeypatch.delenv("MX_COLD_START_FORMAT", raising=False)
+    else:
+        monkeypatch.setenv("MX_COLD_START_FORMAT", fmt)
+    model_config = _model_config()
+    vllm_config = _context_config(load_device="cpu")
+    vllm_config.model_config = model_config
+    adapter = VllmAdapter(vllm_config, model_config)
+    original = getattr(adapter.load_config, "load_format", None)
+    loader = MagicMock()
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.default_loader"],
+        "DefaultModelLoader",
+        loader,
+    )
+    model = nn.Linear(2, 2)
+    adapter.load_via_native(LoadResult(value=model, model=model))
+
+    assert loader.call_args.args[0].load_format == expected
+    assert loader.call_args.args[0] is not adapter.load_config
+    assert getattr(adapter.load_config, "load_format", None) == original

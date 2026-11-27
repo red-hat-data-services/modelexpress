@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::expect_used)]
-
 use modelexpress_common::{
     artifact_manifest::ArtifactManifest,
     grpc::p2p::worker_metadata::SourcePayload,
     grpc::p2p::{
         ArtifactSourceMetadata, BackendFramework, MxSourceType, SourceIdentity, TensorDescriptor,
-        WorkerMetadata,
+        TensorMemoryType, WorkerMetadata,
     },
 };
 use modelexpress_server::p2p::backend::WorkerRecord;
@@ -19,7 +17,7 @@ fn base_identity() -> SourceIdentity {
     SourceIdentity {
         mx_version: "0.8.0".to_string(),
         mx_source_type: MxSourceType::Weights as i32,
-        model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+        model_name: "Qwen/Qwen3.5-0.8B".to_string(),
         backend_framework: BackendFramework::Vllm as i32,
         tensor_parallel_size: 1,
         pipeline_parallel_size: 1,
@@ -79,6 +77,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
             size: 4096,
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            mem_type: TensorMemoryType::Vram as i32,
         }],
         source_payload: Some(SourcePayload::ArtifactSource(ArtifactSourceMetadata {
             artifact_id: "artifact-manifest".to_string(),
@@ -159,6 +158,7 @@ fn tensor_payload_also_populates_legacy_tensors_for_old_readers() {
                     size: 4096,
                     device_id: 0,
                     dtype: "bfloat16".to_string(),
+                    mem_type: TensorMemoryType::Vram as i32,
                 }],
             },
         )),

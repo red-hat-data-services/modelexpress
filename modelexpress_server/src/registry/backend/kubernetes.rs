@@ -20,7 +20,7 @@ use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams, PostParams},
 };
-use modelexpress_common::digest::DigestError;
+use modelexpress_common::digest::{DigestError, sha256_hex};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use serde_json::json;
 use std::{
@@ -129,7 +129,7 @@ fn sanitize_registry_name(model_name: &str) -> Result<String, DigestError> {
         }
     }
     let trimmed = out.trim_matches(|c: char| c == '-' || c == '.');
-    let hash = hex_sha256(model_name)?;
+    let hash = sha256_hex(model_name.as_bytes())?;
     let hash_suffix = &hash[..HASH_SUFFIX_LEN];
     if trimmed.is_empty() {
         // Degenerate input ("", "///", "---"): emit just the hash.
@@ -140,10 +140,6 @@ fn sanitize_registry_name(model_name: &str) -> Result<String, DigestError> {
     let prefix_len = trimmed.len().min(max_prefix);
     let prefix = &trimmed[..prefix_len];
     Ok(format!("{prefix}-{hash_suffix}"))
-}
-
-fn hex_sha256(s: &str) -> Result<String, DigestError> {
-    modelexpress_common::digest::sha256_hex(s.as_bytes())
 }
 
 pub struct KubernetesRegistryBackend {
@@ -1051,7 +1047,6 @@ mod tests {
         );
     }
 
-    #[allow(clippy::expect_used)]
     /// Variant names of a unit-variant enum, read from its derived `Deserialize` impl.
     ///
     /// The derive hands the deserializer the complete variant list, so a new variant shows up
@@ -1093,7 +1088,6 @@ mod tests {
             .expect("type should deserialize as an enum and report its variants")
     }
 
-    #[allow(clippy::expect_used)]
     fn crd_string_enum(pointer: &str) -> BTreeSet<String> {
         let crd = serde_json::to_value(ModelCacheEntry::crd()).expect("CRD should serialize");
         let schema = crd
@@ -1114,7 +1108,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn crd_provider_enum_matches_every_model_provider() {
         let variants = serde_variant_names::<ModelProvider>();
         let providers: Vec<ModelProvider> = variants
@@ -1151,7 +1144,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn crd_phase_enum_matches_every_model_status() {
         let mut written = BTreeSet::from([String::new()]);
         for name in serde_variant_names::<ModelStatus>() {

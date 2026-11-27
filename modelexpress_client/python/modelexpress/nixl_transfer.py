@@ -15,8 +15,11 @@ also uses the same agent for host DRAM chunk staging.
 from __future__ import annotations
 
 import atexit
+import bisect
+import ipaddress
 import logging
 import os
+import socket
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -25,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from . import envs
+from . import p2p_pb2
 from . import ucx_utils
 from .metrics import metrics as transfer_metrics
 from ._nixl import load_nixl_api
@@ -55,6 +59,38 @@ NIXL_DRAM_MEM_TYPE = "DRAM"
 NIXL_VRAM_MEM_TYPE = "VRAM"
 #: The memory kinds a published shard may live in, as NIXL names them.
 NIXL_MEM_TYPES = (NIXL_VRAM_MEM_TYPE, NIXL_DRAM_MEM_TYPE)
+# TensorDescriptor.mem_type values this client can register and read.
+_TENSOR_MEM_TYPES = frozenset(
+    {p2p_pb2.TENSOR_MEMORY_TYPE_VRAM, p2p_pb2.TENSOR_MEMORY_TYPE_DRAM}
+)
+
+
+def _resolve_metadata_host(host: str, port: int) -> str:
+    """Resolve a worker host to the numeric address required by NIXL's socket API."""
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+
+    try:
+        addresses = socket.getaddrinfo(
+            host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise RuntimeError(f"Could not resolve NIXL metadata host {host!r}: {exc}") from exc
+
+    for family, _, _, _, sockaddr in addresses:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        address = sockaddr[0]
+        if family == socket.AF_INET6 and sockaddr[3] and "%" not in address:
+            address = f"{address}%{sockaddr[3]}"
+        return address
+
+    raise RuntimeError(f"No IPv4 or IPv6 address found for NIXL metadata host {host!r}")
 
 
 def is_nixl_available() -> bool:
@@ -89,8 +125,8 @@ def _arena_single_mr_forced() -> bool:
 def _pool_reg_enabled() -> bool:
     """Whether allocation-level pool registration is enabled.
 
-    MX_POOL_REG=1 enables it; default is per-tensor registration. Read at
-    call time so tests can toggle the env var without re-importing.
+    On unless MX_POOL_REG=0, or MX_VMM_ARENA=1 with MX_POOL_REG unset. Read
+    at call time so tests can toggle the env var without re-importing.
     """
     return envs.MX_POOL_REG
 
@@ -116,19 +152,34 @@ def _has_memory_range(size: int, addr: int) -> bool:
     return size > 0 and addr != 0
 
 
-class NixlTransferManager:
-    """
-    Manages a single NIXL agent and RDMA transfers.
+def _spanning_descriptors(
+    descriptors: list[TensorDescriptor],
+    allocations: list[tuple[int, int]],
+) -> list[tuple[TensorDescriptor, int, int]]:
+    """Descriptors that run past the allocation containing their start address.
 
-    Each vLLM worker creates its own instance of this class to handle:
-    - Creating and managing a NIXL agent for the worker's GPU
-    - Registering tensors with NIXL for RDMA access
-    - Executing transfers to receive weights from remote sources
-    - Registering host DRAM buffers for artifact chunk transfer
+    ``allocations`` is the sorted output of ``_find_cuda_allocations`` for the
+    same descriptors. Returns ``(descriptor, alloc_base, alloc_size)`` tuples.
+    """
+    bases = [base for base, _ in allocations]
+    spanning = []
+    for d in descriptors:
+        base, size = allocations[bisect.bisect_right(bases, d.addr) - 1]
+        if d.addr + d.size > base + size:
+            spanning.append((d, base, size))
+    return spanning
+
+
+class NixlTransferManager:
+    """Manage one NIXL agent, registered memory, and RDMA operations.
+
+    The creator controls initialization and shutdown. Borrowers use an active manager
+    without taking ownership of its lifecycle. Register accelerator tensors and host
+    DRAM buffers, connect remote agents, and execute weight or artifact transfers.
 
     Args:
-        agent_name: Name for the NIXL agent
-        device_id: GPU device ID for this worker
+        agent_name: Name for the NIXL agent.
+        device_id: GPU device ID for this worker.
     """
 
     def __init__(
@@ -179,6 +230,11 @@ class NixlTransferManager:
     def agent_name(self) -> str:
         """Get NIXL agent name."""
         return self._agent_name
+
+    @property
+    def accelerator_backend(self) -> AcceleratorBackend:
+        """Backend that classified and registered this agent's tensors."""
+        return self._accelerator_backend
 
     @property
     def backends(self) -> list[str]:
@@ -334,36 +390,50 @@ class NixlTransferManager:
         self._tensors = dict(tensors)
         tensor_descriptors = []
         for name, tensor in tensors.items():
-            size = tensor.numel() * tensor.element_size()
-            addr = tensor.data_ptr()
-            if not _has_memory_range(size, addr):
-                tensor_descriptors.append(
-                    TensorDescriptor(
-                        name=name,
-                        addr=addr,
-                        size=size,
-                        device_id=self._device_id,
-                        dtype=str(tensor.dtype),
-                    )
-                )
-                continue
-
-            if not tensor.is_contiguous():
+            descriptor = self._describe_tensor(name, tensor)
+            if (
+                _has_memory_range(descriptor.size, descriptor.addr)
+                and not tensor.is_contiguous()
+            ):
                 raise RuntimeError(
                     f"Tensor '{name}' is not contiguous. "
                     "Non-contiguous tensors cannot be used for RDMA transfers."
                 )
-            tensor_descriptors.append(
-                TensorDescriptor(
-                    name=name,
-                    addr=addr,
-                    size=size,
-                    device_id=self._device_id,
-                    dtype=str(tensor.dtype),
-                )
-            )
+            tensor_descriptors.append(descriptor)
         self._tensor_descriptors = tensor_descriptors
         return tensor_descriptors
+
+    def _describe_tensor(self, name: str, tensor: torch.Tensor) -> TensorDescriptor:
+        mem_type = self._accelerator_backend.tensor_mem_type(tensor)
+        return TensorDescriptor(
+            name=name,
+            addr=tensor.data_ptr(),
+            size=tensor.numel() * tensor.element_size(),
+            # NIXL registers host memory under device 0.
+            device_id=(
+                0 if mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM else self._device_id
+            ),
+            dtype=str(tensor.dtype),
+            mem_type=mem_type,
+        )
+
+    def _nixl_mem_type_name(self, mem_type: int) -> str:
+        if mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM:
+            return NIXL_DRAM_MEM_TYPE
+        return self._accelerator_backend.nixl_mem_type
+
+    def _register_dram_descriptors(self, descriptors: list[TensorDescriptor]) -> Any:
+        """Register host-memory tensors as NIXL DRAM, one region per tensor."""
+        not_dram = [
+            d.name for d in descriptors if d.mem_type != p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        ]
+        if not_dram:
+            raise ValueError(f"Not host-memory tensors: {not_dram[:5]}")
+        return self._agent.register_memory(
+            [(d.addr, d.size, d.device_id, "") for d in descriptors],
+            mem_type=NIXL_DRAM_MEM_TYPE,
+            backends=self._backends,
+        )
 
     def register_tensors(
         self,
@@ -373,17 +443,16 @@ class NixlTransferManager:
         """
         Register tensors with NIXL for RDMA access.
 
-        With MX_POOL_REG=1, discovers the unique cudaMalloc allocations
-        backing the tensors via cuMemGetAddressRange and registers each
-        allocation as a single NIXL block. This dramatically reduces the
-        number of memory registrations (kernel ibv_reg_mr calls, rkeys,
-        and bytes in the agent metadata blob) without changing transfer
-        semantics: receive_from_source still matches by tensor name and
-        builds per-tensor RDMA descriptors that target addresses inside
-        the registered allocations.
+        With pool registration on (the default), discovers the unique
+        cudaMalloc allocations backing the tensors via cuMemGetAddressRange
+        and registers each allocation as a single NIXL block. This
+        dramatically reduces the number of memory registrations (kernel
+        ibv_reg_mr calls, rkeys, and bytes in the agent metadata blob)
+        without changing transfer semantics: receive_from_source still
+        matches by tensor name and builds per-tensor RDMA descriptors that
+        target addresses inside the registered allocations.
 
-        With MX_POOL_REG unset (default), falls back to per-tensor
-        registration.
+        With MX_POOL_REG=0, falls back to per-tensor registration.
 
         CRITICAL: self._tensors must hold the SAME tensor objects as
         param.data in vLLM. Do NOT call .contiguous() here - that would
@@ -404,16 +473,23 @@ class NixlTransferManager:
             raise RuntimeError("NIXL agent not initialized")
 
         tensor_descriptors = self._build_tensor_descriptors(tensors)
-        registrable_descriptors = [
+        vram_descriptors = [
             descriptor
             for descriptor in tensor_descriptors
             if _has_memory_range(descriptor.size, descriptor.addr)
+            and descriptor.mem_type != p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
         ]
-        registrable_names = {descriptor.name for descriptor in registrable_descriptors}
-        registrable_tensors = [
+        dram_descriptors = [
+            descriptor
+            for descriptor in tensor_descriptors
+            if _has_memory_range(descriptor.size, descriptor.addr)
+            and descriptor.mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        ]
+        vram_names = {descriptor.name for descriptor in vram_descriptors}
+        vram_tensors = [
             tensor
             for name, tensor in self._tensors.items()
-            if name in registrable_names
+            if name in vram_names
         ]
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
@@ -421,16 +497,31 @@ class NixlTransferManager:
         if (
             _pool_reg_enabled()
             and not force_per_tensor
-            and registrable_tensors
-            and all(t.is_cuda for t in registrable_tensors)
+            and vram_tensors
+            and all(t.is_cuda for t in vram_tensors)
         ):
             if self._accelerator_backend.supports_pool_reg():
-                allocations = self._find_cuda_allocations(registrable_descriptors)
+                allocations = self._find_cuda_allocations(vram_descriptors)
+                # A tensor that runs past its allocation (e.g. a VA reservation
+                # backed by several mappings) cannot be covered by one
+                # registration: the allocation is too short, and registering
+                # the tensor itself trips cuda_ipc's range assertion.
+                spanning = _spanning_descriptors(vram_descriptors, allocations)
+                if spanning:
+                    first, alloc_base, alloc_size = spanning[0]
+                    raise RuntimeError(
+                        f"{len(spanning)} of {len(vram_descriptors)} tensors "
+                        "extend past the CUDA allocation containing their start "
+                        f"address and cannot be registered. First: {first.name} "
+                        f"at 0x{first.addr:x} ({first.size} bytes) in allocation "
+                        f"[0x{alloc_base:x}, 0x{alloc_base + alloc_size:x})"
+                    )
             else:
                 allocations = None
-                logger.warning(
-                    "MX_POOL_REG=1 set but %s does not support pool "
-                    "registration; using per-tensor registration",
+                log = logger.warning if "MX_POOL_REG" in os.environ else logger.info
+                log(
+                    "%s does not support pool registration; using per-tensor "
+                    "registration",
                     self._accelerator_backend.name,
                 )
         else:
@@ -457,19 +548,27 @@ class NixlTransferManager:
             self._base_registration_ranges = [
                 (base, base + size) for base, size in allocations
             ]
-        elif registrable_tensors:
+        elif vram_tensors:
             self._registered_memory.append(
                 self._agent.register_memory(
-                    registrable_tensors, backends=self._backends
+                    vram_tensors, backends=self._backends
                 )
             )
-            reg_count = len(registrable_tensors)
+            reg_count = len(vram_tensors)
             self._base_registration_ranges = [
-                (d.addr, d.addr + d.size) for d in registrable_descriptors
+                (d.addr, d.addr + d.size) for d in vram_descriptors
             ]
         else:
             reg_count = 0
             self._base_registration_ranges = []
+        if dram_descriptors:
+            self._registered_memory.append(
+                self._register_dram_descriptors(dram_descriptors)
+            )
+            reg_count += len(dram_descriptors)
+            self._base_registration_ranges += [
+                (d.addr, d.addr + d.size) for d in dram_descriptors
+            ]
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
         # Phase 3: Get agent metadata blob
@@ -490,7 +589,9 @@ class NixlTransferManager:
             f"get_metadata={metadata_time:.3f}s [{len(self._metadata)} bytes])"
         )
         logger.info(
-            f"Registered {reg_count} regions from {len(tensor_descriptors)} tensors "
+            f"Registered {reg_count} regions "
+            f"({reg_count - len(dram_descriptors)} VRAM, {len(dram_descriptors)} DRAM) "
+            f"from {len(tensor_descriptors)} tensors "
             f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB total"
         )
 
@@ -525,7 +626,9 @@ class NixlTransferManager:
                 raise ValueError(
                     f"Tensor '{name}' is already registered at a different address"
                 )
-            if not tensor.is_contiguous():
+            if _has_memory_range(
+                tensor.numel() * tensor.element_size(), tensor.data_ptr()
+            ) and not tensor.is_contiguous():
                 raise RuntimeError(
                     f"Tensor '{name}' is not contiguous. "
                     "Non-contiguous tensors cannot be used for RDMA transfers."
@@ -535,14 +638,7 @@ class NixlTransferManager:
             return self._metadata
 
         new_descriptors = [
-            TensorDescriptor(
-                name=name,
-                addr=tensor.data_ptr(),
-                size=tensor.numel() * tensor.element_size(),
-                device_id=self._device_id,
-                dtype=str(tensor.dtype),
-            )
-            for name, tensor in new_tensors.items()
+            self._describe_tensor(name, tensor) for name, tensor in new_tensors.items()
         ]
         # A view can be smaller than its already-registered parent. Register
         # only maximal uncovered ranges, while publishing every tensor name.
@@ -552,16 +648,11 @@ class NixlTransferManager:
             if registration is not None
         ]
         new_ranges: list[tuple[int, int]] = []
-        registrable: list[torch.Tensor] = []
-        for tensor in sorted(
-            new_tensors.values(),
-            key=lambda t: t.numel() * t.element_size(),
-            reverse=True,
-        ):
-            size = tensor.numel() * tensor.element_size()
-            start, end = tensor.data_ptr(), tensor.data_ptr() + size
+        registrable: list[TensorDescriptor] = []
+        for descriptor in sorted(new_descriptors, key=lambda d: d.size, reverse=True):
+            start, end = descriptor.addr, descriptor.addr + descriptor.size
             if (
-                size > 0
+                _has_memory_range(descriptor.size, start)
                 and not any(
                     base_start <= start and end <= base_end
                     for base_start, base_end in self._base_registration_ranges
@@ -575,14 +666,14 @@ class NixlTransferManager:
                     for reg_start, reg_end in new_ranges
                 )
             ):
-                registrable.append(tensor)
+                registrable.append(descriptor)
                 new_ranges.append((start, end))
         reused_registrations: dict[str, tuple[Any, int, int] | None] = {}
         new_registration_ranges: dict[str, tuple[int, int]] = {}
         for name, tensor in new_tensors.items():
             size = tensor.numel() * tensor.element_size()
             start, end = tensor.data_ptr(), tensor.data_ptr() + size
-            if size == 0 or any(
+            if not _has_memory_range(size, start) or any(
                 base_start <= start and end <= base_end
                 for base_start, base_end in self._base_registration_ranges
             ):
@@ -604,15 +695,29 @@ class NixlTransferManager:
                     for region in new_ranges
                     if region[0] <= start and end <= region[1]
                 )
-        registration = None
-        if registrable:
-            registration = self._agent.register_memory(
-                registrable, backends=self._backends
-            )
+        vram_registrable = [
+            new_tensors[d.name]
+            for d in registrable
+            if d.mem_type != p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        ]
+        dram_registrable = [
+            d for d in registrable if d.mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        ]
+        registrations: dict[int, Any] = {}
         try:
+            if vram_registrable:
+                registrations[p2p_pb2.TENSOR_MEMORY_TYPE_VRAM] = (
+                    self._agent.register_memory(
+                        vram_registrable, backends=self._backends
+                    )
+                )
+            if dram_registrable:
+                registrations[p2p_pb2.TENSOR_MEMORY_TYPE_DRAM] = (
+                    self._register_dram_descriptors(dram_registrable)
+                )
             metadata = self._agent.get_agent_metadata()
         except BaseException:
-            if registration is not None:
+            for registration in registrations.values():
                 try:
                     self._agent.deregister_memory(registration)
                 except Exception:
@@ -622,13 +727,13 @@ class NixlTransferManager:
                     logger.exception("Failed to roll back appended NIXL memory")
             raise
 
-        if registration is not None:
-            self._registered_memory.append(registration)
+        self._registered_memory.extend(registrations.values())
         self._tensors = {**self._tensors, **new_tensors}
         self._tensor_descriptors = self._tensor_descriptors + new_descriptors
-        for name in new_tensors:
+        for descriptor in new_descriptors:
+            name = descriptor.name
             self._appended_registrations[name] = (
-                (registration, *new_registration_ranges[name])
+                (registrations[descriptor.mem_type], *new_registration_ranges[name])
                 if name in new_registration_ranges
                 else reused_registrations[name]
             )
@@ -769,10 +874,17 @@ class NixlTransferManager:
 
         # NIXL resolves descriptors by containment, so one tensor outside
         # [base, base+used) fails prep_xfer_dlist for the whole transfer.
+        dram_descriptors = [
+            d
+            for d in tensor_descriptors
+            if _has_memory_range(d.size, d.addr)
+            and d.mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        ]
         uncovered = [
             d
             for d in tensor_descriptors
             if _has_memory_range(d.size, d.addr)
+            and d.mem_type != p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
             and (d.addr < base or (d.addr + d.size) > (base + used))
         ]
         if uncovered:
@@ -801,6 +913,13 @@ class NixlTransferManager:
             )
         )
         self._base_registration_ranges = [(base, base + used)]
+        if dram_descriptors:
+            self._registered_memory.append(
+                self._register_dram_descriptors(dram_descriptors)
+            )
+            self._base_registration_ranges += [
+                (d.addr, d.addr + d.size) for d in dram_descriptors
+            ]
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
         metadata_start = time.perf_counter()
@@ -811,11 +930,13 @@ class NixlTransferManager:
         reduction = (1 - 1 / len(tensor_descriptors)) * 100 if tensor_descriptors else 0
         logger.info(
             f"[TIMING] register_arena: {nixl_reg_time + metadata_time:.3f}s total "
-            f"(nixl_register={nixl_reg_time:.3f}s [1 region, {used / 1e9:.2f} GB], "
+            f"(nixl_register={nixl_reg_time:.3f}s "
+            f"[1 arena region, {used / 1e9:.2f} GB, {len(dram_descriptors)} DRAM], "
             f"get_metadata={metadata_time:.3f}s [{len(self._metadata)} bytes])"
         )
         logger.info(
-            f"Registered arena as 1 region from {len(tensor_descriptors)} tensors "
+            f"Registered arena as 1 region ({len(dram_descriptors)} DRAM regions "
+            f"beside it) from {len(tensor_descriptors)} tensors "
             f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB live in "
             f"{used / 1e9:.2f} GB arena bump range"
         )
@@ -842,6 +963,10 @@ class NixlTransferManager:
         Returns:
             Sorted list of (alloc_base, alloc_size) tuples for unique
             CUDA allocations.
+
+        Raises:
+            RuntimeError: a tensor runs past the allocation containing its
+                start address, so no single registration could cover it.
         """
         if not descriptors:
             return []
@@ -858,6 +983,13 @@ class NixlTransferManager:
                     f"'{desc.name}' at 0x{desc.addr:x}. Is the tensor on a CUDA device?"
                 )
             base_int = int(alloc_base)
+            alloc_end = base_int + int(alloc_size)
+            if desc.addr + desc.size > alloc_end:
+                raise RuntimeError(
+                    f"Tensor '{desc.name}' at 0x{desc.addr:x} ({desc.size} bytes) "
+                    f"extends past its CUDA allocation "
+                    f"[0x{base_int:x}, 0x{alloc_end:x})"
+                )
             if base_int not in seen:
                 seen[base_int] = int(alloc_size)
 
@@ -975,8 +1107,12 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        logger.info(f"Fetching remote metadata from {remote_agent_name} at {ip}:{port}")
-        self._agent.fetch_remote_metadata(remote_agent_name, ip, port)
+        metadata_ip = _resolve_metadata_host(ip, port)
+        logger.info(
+            "Fetching remote metadata from %s at %s:%s (host=%s)",
+            remote_agent_name, metadata_ip, port, ip,
+        )
+        self._agent.fetch_remote_metadata(remote_agent_name, metadata_ip, port)
 
         start = time.perf_counter()
         while True:
@@ -990,7 +1126,7 @@ class NixlTransferManager:
                     f"Remote metadata loaded for {remote_agent_name} "
                     f"({time.perf_counter() - start:.2f}s)"
                 )
-                self._remote_agents[remote_agent_name] = (ip, port)
+                self._remote_agents[remote_agent_name] = (metadata_ip, port)
                 return
             time.sleep(0.01)
 
@@ -1077,13 +1213,12 @@ class NixlTransferManager:
             remote_agent_name: If set, use this pre-loaded agent (P2P mode)
                 instead of calling add_remote_agent with source_metadata
                 (centralized mode)
-            require_exact_match: When True, require the source manifest and the
-                locally registered tensors to name the exact same set and reject
-                a zero-match transfer. Used for cross-family (heterogeneous)
-                transfers where a name diff can mean vendor-specific hidden or
-                derived tensors, which would otherwise leave part or all of the
-                target at dummy values while RDMA reports success. Same-family
-                transfers leave this False and tolerate subset transfers.
+            require_exact_match: When True, also reject source-only tensors
+                and a zero-match transfer. Used for cross-family (heterogeneous)
+                transfers, where a name diff can mean vendor-specific hidden or
+                derived tensors. Every mode rejects a local tensor the source
+                does not provide, since it would keep its dummy values while
+                RDMA reports success.
             destination_tensors: Optional registered destination catalog used for
                 name matching. Defaults to the most recently registered catalog.
             on_transfer_start: Optional callback invoked immediately before the
@@ -1094,8 +1229,12 @@ class NixlTransferManager:
 
         Raises:
             ManifestMismatchError: On a size/dtype mismatch for a shared tensor,
-                or, when ``require_exact_match`` is set, on any tensor-name
-                mismatch or a zero-match transfer.
+                a local tensor missing from the source manifest, a nonempty
+                source tensor without an address for an allocated local
+                tensor, or a nonempty local tensor without an address. When
+                ``require_exact_match`` is set, also on source-only tensors, any
+                nonempty source tensor without an address, or a zero-match
+                transfer.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
@@ -1118,12 +1257,16 @@ class NixlTransferManager:
             logger.info(f"Using pre-loaded remote agent {remote_agent_name}")
 
         # Match source tensors to local tensors by name and build raw
-        # (addr, size, device_id) descriptor lists for both sides.
+        # (addr, size, device_id) descriptor lists for both sides, grouped by
+        # (remote, local) memory type because NIXL preps one type per list.
         match_start = time.perf_counter()
-        remote_descs: list[tuple[int, int, int]] = []
-        local_descs: list[tuple[int, int, int]] = []
+        groups: dict[
+            tuple[int, int],
+            tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]],
+        ] = {}
         total_bytes = 0
         matched_tensors = 0
+        receive_result = "complete"
 
         for src_tensor in source_tensors:
             local_tensor = local_tensors.get(src_tensor.name)
@@ -1143,9 +1286,25 @@ class NixlTransferManager:
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
                 )
+            if src_tensor.mem_type not in _TENSOR_MEM_TYPES:
+                transfer_metrics.record_nixl_receive("rejected")
+                raise ManifestMismatchError(
+                    f"Tensor '{src_tensor.name}' has unknown memory type "
+                    f"{src_tensor.mem_type}"
+                )
             matched_tensors += 1
             if not _has_memory_range(src_tensor.size, src_tensor.addr):
                 if src_tensor.size > 0:
+                    local_allocated = _has_memory_range(
+                        local_size, local_tensor.data_ptr()
+                    )
+                    if require_exact_match or local_allocated:
+                        transfer_metrics.record_nixl_receive("rejected")
+                        raise ManifestMismatchError(
+                            f"Tensor '{src_tensor.name}' has {src_tensor.size} "
+                            "bytes but no source memory address"
+                        )
+                    receive_result = "partial"
                     logger.warning(
                         "Skipping %d bytes of tensor '%s': source published "
                         "no memory address, so the local tensor keeps its "
@@ -1154,61 +1313,61 @@ class NixlTransferManager:
                         src_tensor.name,
                     )
                 continue
+            local_addr = local_tensor.data_ptr()
+            if not _has_memory_range(local_size, local_addr):
+                transfer_metrics.record_nixl_receive("rejected")
+                raise ManifestMismatchError(
+                    f"Tensor '{src_tensor.name}' has {local_size} "
+                    "bytes but no local memory address"
+                )
+            local_mem_type = self._accelerator_backend.tensor_mem_type(local_tensor)
+            remote_descs, local_descs = groups.setdefault(
+                (src_tensor.mem_type, local_mem_type), ([], [])
+            )
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)
             )
             local_descs.append(
                 (
-                    local_tensor.data_ptr(),
+                    local_addr,
                     local_size,
-                    self._device_id,
+                    # NIXL registers host memory under device 0.
+                    0
+                    if local_mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+                    else self._device_id,
                 )
             )
             total_bytes += src_tensor.size
 
         match_time = time.perf_counter() - match_start
 
-        # Downgraded to `partial` by the name-diff check below, which does not
-        # return early.
-        receive_result = "complete"
-
         # Name-set diff between the source manifest and the locally registered
         # tensors.
         src_names = {s.name for s in source_tensors}
         local_only = sorted(set(local_tensors) - src_names)
         source_only = sorted(src_names - set(local_tensors))
-        if local_only or source_only:
-            if require_exact_match:
-                # Cross-family transfer: a name diff can mean vendor-specific
-                # hidden or derived tensors, so completing the transfer would
-                # leave the local-only tensors at dummy values while reporting
-                # RDMA success. Fail closed instead.
-                transfer_metrics.record_nixl_receive("rejected")
-                raise ManifestMismatchError(
-                    "Tensor name mismatch on heterogeneous transfer: "
-                    f"{len(local_only)} local-only "
-                    f"(first: {local_only[:5]}), "
-                    f"{len(source_only)} source-only "
-                    f"(first: {source_only[:5]})"
-                )
-            # Completing here leaves the local-only tensors at their dummy
-            # values while the transfer still reports success, so the warning is
-            # the only evidence today. Downgrade the outcome rather than
-            # recording now: this path falls through to the same return as a
-            # clean transfer, and recording here would count the receive twice.
-            receive_result = "partial"
-            # Names, not just counts. A local-only tensor keeps its dummy value
-            # while the transfer still reports success, so this line is the only
-            # thing between a partial load and silently wrong output -- and a
-            # count cannot distinguish "48 harmless empty buffers" from "48
-            # weights that never arrived". The strict branch above already
-            # reports names for exactly this reason.
-            logger.warning(
+        if local_only or (source_only and require_exact_match):
+            # A local-only tensor keeps its dummy values while RDMA reports
+            # success. Buffers are no exception: bare tensors derived from the
+            # weights in process_weights_after_loading are adopted as buffers.
+            # Cross-family transfers also reject source-only tensors, which can
+            # be vendor-specific hidden or derived tensors.
+            transfer_metrics.record_nixl_receive("rejected")
+            raise ManifestMismatchError(
                 "Tensor name mismatch between source manifest and local "
-                "registration: %d local-only (first: %s), "
-                "%d source-only (first: %s)",
-                len(local_only),
-                local_only[:10],
+                f"registration: {len(local_only)} local-only "
+                f"(first: {local_only[:5]}), "
+                f"{len(source_only)} source-only "
+                f"(first: {source_only[:5]})"
+            )
+        if source_only:
+            # Downgrade the outcome rather than recording now: this path falls
+            # through to the same return as a clean transfer, and recording here
+            # would count the receive twice.
+            receive_result = "partial"
+            logger.warning(
+                "Source manifest has %d tensors this target does not register "
+                "(first: %s)",
                 len(source_only),
                 source_only[:10],
             )
@@ -1223,8 +1382,8 @@ class NixlTransferManager:
             transfer_metrics.record_nixl_receive("empty")
             return 0, 0, 0.0
 
-        if not remote_descs:
-            logger.info("All %d matching tensors are empty", matched_tensors)
+        if not groups:
+            logger.info("No payload to transfer for %d matching tensors", matched_tensors)
             transfer_metrics.record_nixl_receive(receive_result)
             return 0, matched_tensors, 0.0
 
@@ -1233,41 +1392,51 @@ class NixlTransferManager:
             f"({matched_tensors} tensors, {total_bytes / 1e9:.2f} GB)"
         )
 
-        # Prepare transfer descriptors on both sides.
+        # Prepare every group before starting any transfer, so a preparation
+        # failure leaves local memory untouched and on_transfer_start unfired.
         prep_start = time.perf_counter()
-        src_prepped = self._agent.prep_xfer_dlist(
-            agent_name=remote_agent_name,
-            xfer_list=remote_descs,
-            mem_type=self._accelerator_backend.nixl_mem_type,
-            backends=self._backends,
-        )
-        dst_prepped = self._agent.prep_xfer_dlist(
-            agent_name="",
-            xfer_list=local_descs,
-            mem_type=self._accelerator_backend.nixl_mem_type,
-            backends=self._backends,
-        )
-        prep_time = time.perf_counter() - prep_start
-        logger.info(f"[TIMING] prep_xfer_dlist: {prep_time:.3f}s")
-
-        indices = list(range(len(remote_descs)))
-
-        # Execute transfer
-        handle = self._agent.make_prepped_xfer(
-            operation="READ",
-            local_xfer_side=dst_prepped,
-            local_indices=indices,
-            remote_xfer_side=src_prepped,
-            remote_indices=indices,
-            backends=self._backends,
-        )
+        handles = []
         try:
+            for (remote_mem_type, local_mem_type), (
+                remote_descs,
+                local_descs,
+            ) in groups.items():
+                src_prepped = self._agent.prep_xfer_dlist(
+                    agent_name=remote_agent_name,
+                    xfer_list=remote_descs,
+                    mem_type=self._nixl_mem_type_name(remote_mem_type),
+                    backends=self._backends,
+                )
+                dst_prepped = self._agent.prep_xfer_dlist(
+                    agent_name="",
+                    xfer_list=local_descs,
+                    mem_type=self._nixl_mem_type_name(local_mem_type),
+                    backends=self._backends,
+                )
+                indices = list(range(len(remote_descs)))
+                handles.append(
+                    self._agent.make_prepped_xfer(
+                        operation="READ",
+                        local_xfer_side=dst_prepped,
+                        local_indices=indices,
+                        remote_xfer_side=src_prepped,
+                        remote_indices=indices,
+                        backends=self._backends,
+                    )
+                )
+            prep_time = time.perf_counter() - prep_start
+            logger.info(
+                f"[TIMING] prep_xfer_dlist: {prep_time:.3f}s ({len(handles)} groups)"
+            )
+
             if on_transfer_start is not None:
                 on_transfer_start()
-            self._agent.transfer(handle)
-            self._wait_for_xfer(handle, timeout_seconds, "Transfer")
+            for handle in handles:
+                self._agent.transfer(handle)
+            self._wait_for_xfers(handles, timeout_seconds, "Transfer")
         finally:
-            self._agent.release_xfer_handle(handle)
+            for handle in handles:
+                self._release_xfer_handle(handle)
 
         # CRITICAL: Synchronize the device to ensure RDMA writes are visible.
         # GPUDirect RDMA writes bypass torch streams, so we must sync.

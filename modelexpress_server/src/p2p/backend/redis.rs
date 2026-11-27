@@ -43,6 +43,29 @@ mod keys {
     pub const STATUS_FIELD_PREFIX: &str = "status:";
 }
 
+// A distinct keyspace from server-side artifact download claims. A fresh, unique
+// owner token is required for every attempt, including retries by the same replica.
+const ACQUIRE_DONOR_LEASE_LUA: &str = r#"
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+    return 1
+end
+return 0
+"#;
+
+const RENEW_DONOR_LEASE_LUA: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+"#;
+
+const RELEASE_DONOR_LEASE_LUA: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+return redis.call('DEL', KEYS[1])
+"#;
+
 const REMOVE_WORKER_LUA: &str = r#"
 redis.call('DEL', KEYS[1])
 redis.call('HDEL', KEYS[2], ARGV[1])
@@ -312,6 +335,10 @@ struct TensorRecordJson {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    // Absent in records written before host-memory tensors were published.
+    // VRAM is not written, so VRAM-only records keep their previous size.
+    #[serde(default, skip_serializing_if = "super::is_vram_mem_type")]
+    pub mem_type: i32,
 }
 
 fn serialize_u64_as_string<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
@@ -374,6 +401,7 @@ impl From<TensorRecord> for TensorRecordJson {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            mem_type: record.mem_type,
         }
     }
 }
@@ -386,6 +414,7 @@ impl From<TensorRecordJson> for TensorRecord {
             size: json.size,
             device_id: json.device_id,
             dtype: json.dtype,
+            mem_type: json.mem_type,
         }
     }
 }
@@ -543,6 +572,30 @@ impl From<ArtifactSourceMetadataJson> for ArtifactSourceMetadataRecord {
     }
 }
 
+fn donor_lease_key(compatibility_key: &str) -> String {
+    format!("mx:p2p:donor-lease:{compatibility_key}")
+}
+
+fn validate_donor_lease_identity(compatibility_key: &str, owner_token: &str) -> MetadataResult<()> {
+    if compatibility_key.is_empty() || owner_token.is_empty() {
+        return Err("donor lease compatibility key and owner token must not be empty".into());
+    }
+    Ok(())
+}
+
+fn donor_lease_ttl_ms(
+    compatibility_key: &str,
+    owner_token: &str,
+    duration: std::time::Duration,
+) -> MetadataResult<u64> {
+    validate_donor_lease_identity(compatibility_key, owner_token)?;
+    let millis = u64::try_from(duration.as_millis())?;
+    if millis == 0 || millis > i64::MAX as u64 {
+        return Err("donor lease duration must be between 1 ms and i64::MAX ms".into());
+    }
+    Ok(millis)
+}
+
 /// Redis backend for metadata storage
 pub struct RedisBackend {
     redis: Arc<RwLock<Option<ConnectionManager>>>,
@@ -608,6 +661,60 @@ impl MetadataBackend for RedisBackend {
         };
         info!("Connected to Redis at {}", safe_url);
         Ok(())
+    }
+
+    /// Try to acquire a cold-start donor lease for a compatibility key.
+    ///
+    /// Callers must use a fresh, unpredictable token for each attempt.
+    async fn try_acquire_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        let ttl_ms = donor_lease_ttl_ms(compatibility_key, owner_token, duration)?;
+        let mut conn = self.get_conn().await?;
+        let acquired: i32 = redis::Script::new(ACQUIRE_DONOR_LEASE_LUA)
+            .key(donor_lease_key(compatibility_key))
+            .arg(owner_token)
+            .arg(ttl_ms)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(acquired == 1)
+    }
+
+    /// Extend a lease only if the caller still owns it.
+    async fn renew_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        let ttl_ms = donor_lease_ttl_ms(compatibility_key, owner_token, duration)?;
+        let mut conn = self.get_conn().await?;
+        let renewed: i32 = redis::Script::new(RENEW_DONOR_LEASE_LUA)
+            .key(donor_lease_key(compatibility_key))
+            .arg(owner_token)
+            .arg(ttl_ms)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(renewed == 1)
+    }
+
+    /// Release a lease only if the caller still owns it.
+    async fn release_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+    ) -> MetadataResult<bool> {
+        validate_donor_lease_identity(compatibility_key, owner_token)?;
+        let mut conn = self.get_conn().await?;
+        let released: i32 = redis::Script::new(RELEASE_DONOR_LEASE_LUA)
+            .key(donor_lease_key(compatibility_key))
+            .arg(owner_token)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(released == 1)
     }
 
     async fn publish_metadata(
@@ -1145,11 +1252,92 @@ impl MetadataBackend for RedisBackend {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use modelexpress_common::grpc::p2p::TensorMemoryType;
 
     // ── TensorRecordJson serialization ──────────────────────────────────────
+
+    #[test]
+    fn donor_lease_validates_identity_and_duration() {
+        use std::time::Duration;
+        assert!(donor_lease_ttl_ms("", "token", Duration::from_secs(1)).is_err());
+        assert!(donor_lease_ttl_ms("key", "", Duration::from_secs(1)).is_err());
+        assert!(donor_lease_ttl_ms("key", "token", Duration::from_nanos(1)).is_err());
+        assert!(donor_lease_ttl_ms("key", "token", Duration::from_millis(u64::MAX)).is_err());
+        assert_eq!(
+            donor_lease_ttl_ms("key", "token", Duration::from_secs(1)).expect("valid"),
+            1000
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn donor_lease_acquire_expire_and_fence_stale_owners() {
+        use std::time::Duration;
+        let redis_url = std::env::var("MX_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let backend = RedisBackend::new(&redis_url);
+        let key = uuid::Uuid::new_v4().to_string();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        let ttl = Duration::from_secs(10);
+        let (a, b) = tokio::join!(
+            backend.try_acquire_donor_lease(&key, &first, ttl),
+            backend.try_acquire_donor_lease(&key, &second, ttl),
+        );
+        let a = a.expect("acquire first");
+        let b = b.expect("acquire second");
+        assert_ne!(a, b);
+        let (owner, other) = if a {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert!(
+            !backend
+                .renew_donor_lease(&key, other, ttl)
+                .await
+                .expect("renew")
+        );
+        assert!(
+            !backend
+                .release_donor_lease(&key, other)
+                .await
+                .expect("release")
+        );
+        assert!(
+            backend
+                .renew_donor_lease(&key, owner, Duration::from_millis(20))
+                .await
+                .expect("renew")
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            backend
+                .try_acquire_donor_lease(&key, other, ttl)
+                .await
+                .expect("take over")
+        );
+        assert!(
+            !backend
+                .renew_donor_lease(&key, owner, ttl)
+                .await
+                .expect("stale renew")
+        );
+        assert!(
+            !backend
+                .release_donor_lease(&key, owner)
+                .await
+                .expect("stale release")
+        );
+        assert!(
+            backend
+                .release_donor_lease(&key, other)
+                .await
+                .expect("release owner")
+        );
+    }
 
     #[test]
     fn test_tensor_record_json_roundtrip() {
@@ -1159,6 +1347,7 @@ mod tests {
             size: 1_073_741_824,
             device_id: 3,
             dtype: "bfloat16".to_string(),
+            mem_type: TensorMemoryType::Dram as i32,
         };
         let json_record = TensorRecordJson::from(record.clone());
         let json = serde_json::to_string(&json_record).expect("serialize");
@@ -1173,6 +1362,21 @@ mod tests {
         assert_eq!(back.size, record.size);
         assert_eq!(back.device_id, record.device_id);
         assert_eq!(back.dtype, record.dtype);
+        assert_eq!(back.mem_type, record.mem_type);
+    }
+
+    #[test]
+    fn test_tensor_record_json_without_mem_type() {
+        let json = r#"{"name":"w","addr":"4096","size":"64","device_id":0,"dtype":"f16"}"#;
+        let t: TensorRecordJson = serde_json::from_str(json).expect("parse legacy record");
+        assert_eq!(t.mem_type, TensorMemoryType::Vram as i32);
+    }
+
+    #[test]
+    fn test_tensor_record_json_omits_vram_mem_type() {
+        let json = r#"{"name":"w","addr":"4096","size":"64","device_id":0,"dtype":"f16"}"#;
+        let t: TensorRecordJson = serde_json::from_str(json).expect("parse legacy record");
+        assert_eq!(serde_json::to_string(&t).expect("serialize"), json);
     }
 
     #[test]
@@ -1213,6 +1417,7 @@ mod tests {
                 size: 512,
                 device_id: 2,
                 dtype: "float16".to_string(),
+                mem_type: TensorMemoryType::Vram as i32,
             }],
             status: 2, // SOURCE_STATUS_READY
             updated_at: 1_700_000_000_000,

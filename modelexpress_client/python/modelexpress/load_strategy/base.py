@@ -17,7 +17,7 @@ import torch.nn as nn
 from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
-from ..tensor_utils import log_tensor_summary
+from ..tensor_utils import log_tensor_summary, undiscovered_parameters
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
@@ -320,6 +320,20 @@ def register_tensors(
                 )
                 return
 
+            # A peer would keep dummy values for parameters discovery skips.
+            # Raise instead of returning so the handler below also releases a
+            # manager that artifact install already created.
+            skipped = undiscovered_parameters(
+                result.model,
+                ctx.accelerator_backend,
+                include_host_parameters=ctx.adapter.discovers_host_parameters(),
+            )
+            if skipped:
+                raise RuntimeError(
+                    f"{len(skipped)} parameters are in memory that discovery "
+                    f"does not collect from (first: {skipped[0]})"
+                )
+
             ctx.tensors = ctx.adapter.discover_tensors(result)
             if ctx.p2p_role == "draft":
                 ctx.tensors = {
@@ -337,13 +351,21 @@ def register_tensors(
             else:
                 base_port = envs.MX_METADATA_PORT
                 listen_port = base_port + ctx.device_id
-                ctx.nixl_manager = _init_nixl_manager(
-                    ctx.global_rank,
-                    ctx.device_id,
-                    "auto",
-                    listen_port,
-                    ctx.accelerator_backend,
-                )
+                try:
+                    ctx.nixl_manager = _init_nixl_manager(
+                        ctx.global_rank,
+                        ctx.device_id,
+                        "auto",
+                        listen_port,
+                        ctx.accelerator_backend,
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"NIXL agent with listen port {listen_port} = "
+                        f"MX_METADATA_PORT ({base_port}) + device_id "
+                        f"({ctx.device_id}) failed to start; if the port is "
+                        f"taken by another service, change MX_METADATA_PORT: {e}"
+                    ) from e
 
         if ctx.p2p_role == "draft":
             # Reusing the target's manager means tensor_descriptors is already
@@ -432,6 +454,7 @@ def publish_metadata(ctx: LoadContext) -> None:
                 ctx.tensors,
                 device_id=ctx.device_id,
                 worker_rank=ctx.worker_rank,
+                accelerator_backend=ctx.accelerator_backend,
             )
         except Exception as e:
             logger.warning(
@@ -453,6 +476,7 @@ def publish_metadata(ctx: LoadContext) -> None:
             ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
             accelerator=ctx.accelerator_backend.name,
             ready_fn=ctx.source_ready_fn,
+            accelerator_backend=ctx.accelerator_backend,
         )
     except Exception as e:
         logger.warning(

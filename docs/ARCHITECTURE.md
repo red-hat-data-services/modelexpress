@@ -365,12 +365,13 @@ Cache eviction parses the key back to delete the right snapshot. It keeps the fi
 
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
-| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes worker metadata (identity + tensors + backend metadata) |
+| `DonorLease` | `DonorLeaseRequest` | `DonorLeaseResponse` | Acquire, renew, or release a donor lease for cold-start coordination |
+| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes worker metadata (identity + tensors + backend metadata); server stamps `updated_at` for heartbeat expiry |
 | `ListSources` | `ListSourcesRequest` | `ListSourcesResponse` | Lightweight listing of available source workers (no tensor data) |
 | `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Fetch full tensor metadata for one specific worker (MB-scale, on demand) |
 | `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Update per-worker lifecycle status (Initializing/Ready/Stale) |
 
-Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility and `mx_source_id`), `WorkerMetadata` (rank, runtime `accelerator`, oneof backend_metadata, tensors, status, P2P endpoint fields), `TensorDescriptor` (name, addr, size, device_id, dtype), `SourceInstanceRef` (lightweight worker reference for listing, including runtime `accelerator` for pre-fetch compatibility filtering).
+Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility and `mx_source_id`), `WorkerMetadata` (rank, runtime `accelerator`, oneof backend_metadata, tensors, status, P2P endpoint fields), `TensorDescriptor` (name, addr, size, device_id, dtype, mem_type; `mem_type` is the `TensorMemoryType` the source registered the bytes as, VRAM or DRAM, and `device_id` is 0 for DRAM; descriptors without it decode as VRAM, including Redis and Kubernetes records written before the field existed), `SourceInstanceRef` (lightweight worker reference for listing, including runtime `accelerator` for pre-fetch compatibility filtering).
 
 Rust and Python compute `mx_source_id` from the same normalized, sorted-key JSON encoded as UTF-8, preserving non-ASCII identity strings.
 
@@ -387,6 +388,26 @@ Rust and Python compute `mx_source_id` from the same normalized, sorted-key JSON
 Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors or artifact manifest metadata from the central server. `GetTensorManifestResponse` carries the source worker's runtime `accelerator` value so decentralized targets can apply the same compatibility filter as central metadata mode. RL generator lease behavior is documented in the [refit architecture](rl/ARCHITECTURE.md#refit-service-and-version-model). Ordinary inference loading continues to use `GetTensorManifest` without the RL mutation fence. Artifact byte transfer still uses NIXL; `PrepareArtifactChunk` only exposes a source-side registered DRAM range for one sealed artifact chunk. Tensor RPCs require `mx_source_id` and validate the selected runtime `worker_id` when present to catch stale discovery records whose endpoint has been reused by a new process.
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
+
+With `MX_P2P_COLD_START=1`, rank zero of each fixed vLLM worker group
+checks for READY sources and competes for a Redis lease per source identity.
+The lease holder skips RDMA in the strategy chain; followers wait for compatible
+READY ranks before using the chain. If coordination fails or the configured
+election wait expires, replicas also skip RDMA and can load concurrently from
+storage. Other loading failures can still prevent startup.
+Publication is not fenced:
+an expired donor can still finish and publish, and normal P2P fallback remains
+available. READY ranks need not belong to the same replica. The world group must
+match TP × PP × DP, with contiguous global worker ranks; prefill and decode
+context parallelism greater than one, elastic EP and larger external-DP groups
+are rejected by the opt-in path. The opt-in source
+identity includes DP and prefill/decode context parallelism, so it does not reuse
+sources published without the opt-in. Speculative drafts do not run election:
+same-checkpoint drafts use the existing publication gate. With vLLM,
+separate-checkpoint drafts can join the main publication and use P2P when
+`MX_ENABLE_SEPARATE_DRAFT_P2P=1`; otherwise they use the ordinary storage
+fallback. This opt-in has no effect on SGLang. TP, DP, and PP have been validated
+on GPUs; expert parallelism has not been validated end to end on GPUs.
 
 ### RL refit service
 
@@ -627,7 +648,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `modelexpress` and `mx` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
-| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
+| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled, falls back to generic per-tensor NIXL registration, and requires no classic-allocator pool for registered buffers. `tensor_mem_type(tensor)` classifies a tensor as VRAM or DRAM for registration, publication, and receive. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
@@ -635,12 +656,13 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `plugins.py` | Discovery, validation, and selection of external loading strategy classes |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
-| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ServerCacheStrategy` (weights streamed from MX Server), `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
+| `engines/startup.py` | Local artifact startup gate with synchronization failure handling |
+| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ServerCacheStrategy` (weights streamed from MX Server), `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy`; `LoadContext` carries separate weight and artifact readiness callbacks |
 | `model_client.py` | `ModelCacheClient` - `ModelService` RPCs plus stream validation for server-cached models |
 | `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, revision refs, metadata inventories |
 | `model_prefetch.py` | Pre-engine metadata prefetch and repo-id resolution for server-backed loading |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map initial-load strategy hooks to vLLM loader APIs |
-| `engines/sglang/` | `SglangAdapter` and `MxModelLoader` map strategy hooks to SGLang's `remote_instance` backend; `draft_weights.py` owns model-specific role rules and `checkpoint_selection.py` filters complete safetensors shards before ModelStreamer reads them |
+| `engines/sglang/` | `SglangAdapter` and `MxModelLoader` map strategy hooks to SGLang's `remote_instance` backend; `readiness.py` discovers the resolved HTTP health listener; `draft_weights.py` owns model-specific role rules and `checkpoint_selection.py` filters complete safetensors shards before ModelStreamer reads them |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
 | `vllm_worker.py` | `ModelExpressWorker` - compatibility worker class for older manual-registration workflows |
@@ -648,6 +670,10 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
 
 RL trainers and generators use the optional `modelexpress_rl` namespace from the same Python distribution. See the [RL package guide](rl/README.md) and [RL refit architecture](rl/ARCHITECTURE.md).
+
+Trainer NIXL refit stages ordered source replay batches for engine installation.
+Direct generator-peer refit owns its donor leases and reads in the runtime-tensor
+update method, borrowing the inference NIXL manager independently of trainer staging.
 
 ### MxClient
 
@@ -668,13 +694,18 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | Method | Purpose |
 |--------|---------|
 | `__init__(agent_name, device_id, listen_port, accelerator_backend)` | Create NIXL agent with UCX backend; `listen_port` enables P2P listen thread; `accelerator_backend` owns torch device operations and accelerator capability gates |
-| `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata. With `MX_POOL_REG=1` on a backend that supports pool registration, registers each unique cudaMalloc allocation backing the tensors instead of registering each tensor individually |
-| `register_arena(arena, tensors)` | Register the used VMM arena range once through dmabuf when the active accelerator backend supports the VMM arena fast path, then publish every tensor descriptor against that single MR. Falls back to per-tensor registration when a tensor lies outside the arena range, or when the arena spans several `cuMemCreate` handles (a single MR cannot be addressed by cuda_ipc then; override with `MX_ARENA_SINGLE_MR=1`) |
-| `register_additional_tensors(tensors)` | Append tensors to an already-registered catalog instead of replacing it (`register_tensors` / `register_arena` replace the name -> tensor catalog). Tensors fully covered by the main or a prior appended registration reuse its range; only uncovered ranges are registered. The call refreshes agent metadata, skips names already registered at the same address, and rejects a name registered at a different address. Used by the speculative draft pass on the main load's agent |
+| `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata. With `MX_POOL_REG=1` on a backend that supports pool registration, registers each unique cudaMalloc allocation backing the tensors instead of registering each tensor individually. Raises when a tensor extends past the allocation containing its start address (e.g. a VA reservation backed by several mappings): neither that allocation nor a per-tensor registration can cover it, so the worker does not serve P2P. Tensors the backend classifies as host memory are registered separately as NIXL DRAM, one region per tensor on device 0, so they do not disable pool registration for the accelerator tensors |
+| `register_arena(arena, tensors)` | Register the used VMM arena range once through dmabuf when the active accelerator backend supports the VMM arena fast path, then publish every tensor descriptor against that single MR. Falls back to per-tensor registration when a tensor lies outside the arena range, or when the arena spans several `cuMemCreate` handles (a single MR cannot be addressed by cuda_ipc then; override with `MX_ARENA_SINGLE_MR=1`). Host-memory tensors never lie in the arena; they are registered as DRAM next to the arena MR and do not trigger the fallback |
+| `register_additional_tensors(tensors)` | Append tensors to an already-registered catalog instead of replacing it (`register_tensors` / `register_arena` replace the name -> tensor catalog). Tensors fully covered by the main or a prior appended registration reuse its range; only uncovered ranges are registered. The call refreshes agent metadata, skips names already registered at the same address, and rejects a name registered at a different address. Uncovered host-memory tensors get their own DRAM registration. Used by the speculative draft pass on the main load's agent |
 | `deregister_tensors(names)` | Release tensors added by `register_additional_tensors` (catalog entries and, once unused, their registration handle). Base-catalog names are ignored; `shutdown()` releases those |
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
-| `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
+| `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P). Reads are grouped by (source, local) memory type, one NIXL transfer per group; every group is prepared before any transfer starts. A source descriptor with an unknown `mem_type` raises `ManifestMismatchError` |
 | `shutdown()` | Clean up NIXL agent and resources |
+
+For socket metadata exchange, `fetch_remote_and_wait` resolves worker hostnames
+to numeric IPv4 or IPv6 addresses before calling NIXL. Numeric addresses bypass
+DNS, bracketed IPv6 literals are unwrapped, and IPv6 scope IDs are preserved.
+The resolved endpoint is retained with the loaded peer for lifecycle tracking.
 
 **Optional NIC pinning.** `MX_RDMA_NIC_PIN=auto` probes PCIe topology at agent init and pins `UCX_NET_DEVICES` to a NUMA-local IB NIC per worker. Workaround for [openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259); see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for details.
 
@@ -688,7 +719,7 @@ After successful RDMA receive and target-local finalization, the vLLM adapter
 synchronizes the accelerator and clears unused allocator cache before subsequent
 initialization. Live model tensors remain allocated.
 
-**MTP two-pass load.** vLLM loads the main model and then the speculative draft on the same worker. The main pass owns one NIXL agent, metadata listener, and source publication. A draft from the same checkpoint reuses that agent and appends its tensors under the `mx_draft::` namespace; it does not bind a second listener or replace the main tensor registry. A draft with a different `SourceIdentity` remains storage-only. The receiving main pass ignores draft descriptors, while the receiving draft pass requires complete coverage of its own descriptors. The main publication waits for the draft pass (or the engine health endpoint) so a peer does not discover a half-populated source. Failed draft registration rolls back only draft tensors, not the live main agent.
+**MTP two-pass load.** vLLM loads the main model and then the speculative draft on the same worker. The main pass owns one NIXL agent, metadata listener, and source publication. A draft from the same checkpoint reuses that agent and appends its tensors under the `mx_draft::` namespace; it does not bind a second listener or replace the main tensor registry. With `MX_ENABLE_SEPARATE_DRAFT_P2P=1`, a separate-checkpoint draft discovers peers through the main source identity and uses a compatibility-digested tensor namespace. It falls back to storage if its identity is incomplete or no compatible source is available. The receiving main pass ignores draft descriptors, while the receiving draft pass requires complete coverage of its own descriptors. The main publication waits for the draft pass (or the engine health endpoint) so a peer does not discover a half-populated source. Failed draft registration rolls back only draft tensors, not the live main agent.
 
 For a cold MTP source, ModelStreamer asks the initialized vLLM model for `is_unused_checkpoint_weight`, when available, and selects **complete shard files** before reading them. A RunAI loader that accepts the predicate handles selection itself; otherwise MX uses vLLM's local safetensors filter or a generic checkpoint-index selector. The model-owned hook always takes precedence. For older engines without the hook, MX has a bounded draft-only fallback for the Qwen3.5, Qwen3-Next, DeepSeek MTP, GLM4-MoE MTP and GLM4-MoE-Lite MTP loader classes. Qwen's legacy rule retains `mtp.*`, embedding and head weights; the DeepSeek/GLM paths reuse the installed loader's layer-selection helper with its runtime config. Unsupported classes, missing helpers/configuration or unusable optional index metadata retain full-file loading. Main models without a hook also retain full-file loading. Mixed shards may be read twice. This is not tensor-range filtering; vLLM still performs tensor mapping and `load_weights`. A draft that lacks a compatible main agent or READY peer can use the usual storage strategies. For P2P, Step3.5 keeps its per-layer `shared_head.head` tensors: unlike the base MTP proposer, its proposer does not replace them with the target head.
 
@@ -744,12 +775,86 @@ transport. For `transport=nixl`, it runs `LoadStrategyChain.run()` and updates
 global registries. For `transport=transfer_engine`, it uses SGLang's initialized
 TransferEngine and ModelExpress metadata directly: first replica loads natively,
 registers TransferEngine memory, and publishes its session; later replicas
-discover that source and pull with `batch_transfer_sync_read`.
+discover that source and pull with `submit_scatter_read` completion tickets.
+Receivers require Mooncake >=0.3.14 with the retained-ticket API; unsupported
+receivers are rejected after source discovery, before preparing or registering
+destination weights. A seed with no source can load natively, register memory,
+and publish without the ticket API. Receives validate
+the complete tensor manifest before submission and cap each batch at 1 GiB,
+splitting individual tensors when needed. This limits the number of outstanding
+transport slices for large model loads. Manifest validation, byte-range batching,
+batch submission, and ticket draining use separate helpers in the receive path.
+
+The byte cap also bounds CPU work in the classic RDMA posting path. Mooncake
+0.3.11.post1 initializes work-request arrays for the entire pending slice queue
+on each posting pass, rather than the QP posting limit
+([upstream fix](https://github.com/kvcache-ai/Mooncake/pull/2490)). Mooncake
+0.3.14 fixes that allocation but still rewrites endpoint and completion-token
+metadata for every pending slice before posting a subset
+([worker loop](https://github.com/kvcache-ai/Mooncake/blob/v0.3.14/mooncake-transfer-engine/src/transport/rdma_transport/worker_pool.cpp#L1016-L1021)).
+Bounding each receive limits these queue costs independently of the native RDMA
+slice size; it does not establish completion after a timeout.
+
+Each ticket is drained in one-second waits while its tensors, registrations,
+and engine remain owned. Pending receives emit a warning every 30 seconds with
+the worker rank, elapsed drain time, and batch size in bytes.
+`COMPLETION_UNKNOWN` keeps the load pending; it does
+not permit buffer reuse or the next batch. After `FAILED_DRAINED`, the loader
+can unregister the buffers, reinitialize the model, and fall back natively.
+If submission or draining raises, the operation and buffers remain retained
+and the error propagates without native fallback or a forced process exit.
+Interrupted loads also retain their outstanding resources. A permanently
+undrainable operation requires supervised worker recovery; the classic backend
+does not guarantee bounded cancellation. Discovery and validation failures
+before submission retain their native fallback behavior.
+
 `SglangAdapter` owns SGLang-specific rank/device mapping, native fallback
 loading, quantized-weight post-processing, and tensor discovery, including the
 storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
+
+TransferEngine registration uses PyTorch's CUDA allocator snapshot to register
+each occupied block once and merge adjacent selected blocks within the same
+non-expandable segment. A tensor's complete byte range must fit inside an
+active allocation block, including buffers and storage views with nonzero
+offsets. Unrecognized ranges retain per-tensor registration; expandable segments,
+non-CUDA backends, and unavailable or malformed snapshots do not use this
+optimization.
+Merging never crosses allocation boundaries or unselected blocks. If expanding
+a block would overlap an unrecognized range, the whole registration falls back
+to the original tensor ranges. Transfers use each tensor's original address and
+size. When coalescing leaves every range unchanged, the loader tries the
+original ranges once. If the coalesced attempt fails, the loader rolls back
+its successful registrations. After a complete rollback, it retries once with
+the original deduplicated tensor ranges. If the retry fails,
+it cleans up that attempt before the receiver falls back to native loading or
+the seed skips source publication. A drained receive failure unregisters the
+bases from the successful attempt. Registration logs report the final region
+count, tensor count, registered bytes, and total time across attempts.
+Failure logs identify the registration attempt as `coalesced` or `original`.
+Both attempts use Mooncake's single-region `register_memory` API.
+
+**Cold-load quantization state.** A source manifest can describe buffers whose
+existence depends on checkpoint values. After placeholder post-processing and
+before registering destination memory, the receive strategy calls
+`prepare_rdma_target_from_manifest` with model-relative tensor names (stripping
+the draft namespace for the adapter). SGLang's `runtime_state.py` uses the
+presence of `weight_scale_inv_swizzled` to recover the donor's block-FP8 MXFP8
+decision for FlashInfer CuTeDSL/CUTLASS. It allocates the engine-defined scale
+layout without priming floating scales or reshuffling weights. The existing
+manifest carries this decision; no new wire fields or server upgrade are needed.
+
+SGLang requires an exact NIXL tensor catalog. TransferEngine also rejects
+source-only tensors before submitting a read. After transfer, SGLang validates
+MXFP8 eligibility against the received scales before enabling that dispatch,
+and refreshes `k_scale_float` / `v_scale_float` from already-normalized device
+scales. It does not rerun full post-processing or reallocate registered storage.
+Invalid descriptors, inconsistent scales, and unsupported donor-dependent
+layouts fail the attempt and use the existing cold-load recovery/fallback path.
+This does not add optimized support for Hopper's optional BF16 weight cache or
+ROCm MXFP8 layouts; mismatches remain failures. Warm reloads skip cold-load
+preparation and retain their existing same-identity restrictions.
 
 **Speculative draft pass.** SGLang's EAGLE worker builds a second ModelRunner
 for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
@@ -955,11 +1060,11 @@ During transfer, `ManifestMismatchError` is raised if source and target tensor n
 
 After loading by any strategy, the worker starts a `PublisherThread` that owns initial publication retry and then periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the publisher sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged and retried in the publisher thread instead of crashing the worker.
 
-Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and publishes independently. Workers use `torch.distributed.get_rank()` as their global rank (captures both TP and PP position).
+Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and publishes independently. The server only accepts a `worker_id` of at most 63 bytes made of lowercase alphanumerics, `-` and `.`, with each dot-separated segment starting and ending alphanumeric, on `PublishMetadata`, `GetMetadata` and `UpdateStatus`. Custom producers emitting anything else, uppercase included, must change their IDs; records a Redis backend stored under such an ID before this check can still be listed but no longer fetched or updated. Workers use `torch.distributed.get_rank()` as their global rank (captures both TP and PP position).
 
 ### Tensor Discovery
 
-The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree via `named_parameters()` and `named_buffers()`, keeping tensors accepted by the active `AcceleratorBackend.is_accel_tensor()` predicate after post-processing. `CudaAcceleratorBackend` and `XpuAcceleratorBackend` are the concrete backends today, so collection targets CUDA or XPU tensors depending on the active backend. This discovers three categories:
+The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree via `named_parameters()` and `named_buffers()`, keeping tensors accepted by the active `AcceleratorBackend.is_accel_tensor()` predicate after post-processing. `CudaAcceleratorBackend` and `XpuAcceleratorBackend` are the concrete backends today, so collection targets CUDA or XPU tensors depending on the active backend. The vLLM and SGLang adapters also pass `include_host_parameters=True`, which adds parameters in host memory (see [Parameters in Host Memory](#parameters-in-host-memory)). This discovers three categories:
 
 | Category | Source | Example |
 |----------|--------|---------|
@@ -1039,11 +1144,37 @@ agent.release_xfer_handle(handle)
 
 ## FP8 Model Handling (DeepSeek-V3)
 
+Iterator-based vLLM loading owns buffered FP8 indexer weights and scales before
+replaying complete pairs. Pending buffers on the wrapper and its inner modules
+are cleared before each load. BF16 weights and pre-fused projections pass through;
+an FP8 indexer weight missing its scale fails explicitly. The partial pair replay
+suppresses MTP completeness checks only for that second load; the initial
+checkpoint load retains draft-layer validation. A CUDA integration test checks
+that replay through the real vLLM fused loader preserves both projection shards;
+it skips when CUDA or vLLM is unavailable.
+
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
+
+For quant methods with `uses_meta_device`, vLLM's native loader runs `finalize_layerwise_processing()` after loading weights and before `process_weights_after_loading()`. ModelExpress uses the standalone `load_weights()` API inside its strategy chain, so its vLLM adapter mirrors that ordering for native, streamed, and RDMA target loads. For native and streamed checkpoint loading, skipping the layerwise finalizer can leave remaining online-FP8 parameters on the Meta device; Qwen3.5 then fails in `_C::static_scaled_fp8_quant` during post-load processing. Before finalizing online-quantized models, these two paths also run `gc.collect()` and empty the accelerator allocator cache, as native loading does in vLLM 0.32 and later; with InstantTensor this releases the blocks the loader left cached. Checkpoint loads without online quantization skip this cleanup. RDMA target preparation leaves the cache untouched and releases it only after a successful receive.
+
+RDMA target preparation uses `DummyModelLoader`. In the tested vLLM 0.29 online-FP8 path, the dummy loader has already materialized and quantized the online layers before the adapter's finalizer runs, leaving no pending layerwise work. The additional finalizer call leaves parameter and buffer layouts unchanged in this path.
 
 The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers transferable accelerator tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout and receives the real data, including hidden quant config tensors, via RDMA.
 
 The vLLM adapter passes an exclusion predicate to engine-agnostic hidden-tensor discovery, skipping the exact `vllm.models.kimi_k3.nvidia.ops.latent_moe_tail.KimiK3LatentMoETailOp` class. Its GPU peer-pointer arrays, barriers, and multicast workspaces are process-local collective state and must retain the receiver's allocations and contents. Transferring donor collective state can cause CUDA illegal-address errors during receiver warmup. Hidden quantization tensors outside this operator remain eligible for adoption and RDMA transfer.
+
+The SGLang adapter's predicate skips any object whose class is defined under `sglang.srt.distributed`, `sglang.srt.layers.communication`, or `torch.distributed`. Communication workspaces such as `FinalizePushWorkspace` hold direct references to the communicator's push counter and slabs, so excluding the communicator alone is not enough. SGLang layers keep their `GroupCoordinator` as `tp_group`, so without it the scan reaches the custom all-reduce communicator and copies the donor's epoch counters, symmetric slab, and CUDA-graph pointer table. Those tensors match in size across instances, so the transfer succeeds, but the receiver's ranks then disagree on epoch parity and the first push all-reduce deadlocks.
+
+The vLLM adapter identifies FlashInfer MLA attention layers through
+`attn_backend.get_name() == "FLASHINFER_MLA"`, independently of the implementation
+class name or module path. It preserves the instance-owned
+`impl._multi_ctas_kv_counter_buffer` and excludes that tensor from hidden-tensor
+adoption. Collection also omits buffer aliases within the counter's byte range,
+including previously adopted buffers, while retaining unrelated hidden derived
+tensors. Parameters, partial buffer overlaps, and widened storage transfers that
+overlap local state raise a classification error. This bounded compatibility rule
+does not classify arbitrary runtime buffers or implementations without a declared
+backend; versions using a module-global counter need no instance-field exclusion.
 
 ```mermaid
 graph TD
@@ -1082,12 +1213,17 @@ graph TD
 Zero-byte and unallocated (null-address) tensors remain in manifests and
 participate in exact name, size, and dtype validation. On the sender they stay
 in the published manifest but are excluded from NIXL registration; on the
-receiver they count as matched tensors but are omitted from NIXL descriptor
-lists because they have no registered memory range; a nonzero-size tensor
-skipped this way logs a warning, since the local tensor keeps its current
-values. Arena registration ignores such tensors in its containment check. Both
-sides share one predicate for this. A manifest made entirely of empty tensors completes as a
-successful no-op transfer.
+receiver zero-byte tensors count as matched but are omitted from NIXL
+descriptor lists. A nonzero-size source tensor without an address is rejected
+when exact matching is required or when the matching local tensor is
+allocated, since the local tensor would keep its current values. Otherwise it
+is skipped with a warning and the receive is recorded as partial. A source with payload matched to a nonzero-size local tensor without
+an address is rejected in every mode before preparing NIXL descriptors.
+Arena and additional-tensor registration exclude both empty and unallocated
+tensors from memory-range and contiguity checks, while retaining their names
+in the catalog. All registration paths share the same memory-range predicate.
+A manifest made entirely of zero-byte tensors completes as a successful no-op
+transfer, including in exact-match mode.
 
 Tarred cache artifacts carry regular files and directories only. The source
 side enumerates members explicitly and hands tar that list, so nothing else can
@@ -1114,7 +1250,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |
-| `MX_POOL_REG` | `0` | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged. Not required for `MX_VMM_ARENA=1`, which registers the arena directly |
+| `MX_POOL_REG` | `1` (`0` with `MX_VMM_ARENA=1`) | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged. Not required for `MX_VMM_ARENA=1`, which registers the arena directly |
 | `MX_VMM_ARENA` | `0` | Install a `CUDAPluggableAllocator` that routes weight-loading allocations into a CUDA VMM arena, then registers the used arena range once through dmabuf at end-of-load. Reserves 16.0 TiB of VA by default and commits physical memory only for mapped allocations. See [VMM Arena](#vmm-arena-cudapluggableallocator-hook) |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange on source workers. Set to `0` to publish full metadata through a central-coordinator backend; ignored on decentralized backends that require P2P metadata |
@@ -1123,10 +1259,11 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. The default `nixl` artifact backend requires P2P metadata and is skipped when `MX_P2P_METADATA=0`; the `mooncake` backend is independent of P2P metadata. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
+| `MX_ARTIFACT_READY_URL` | engine-specific | Explicit HTTP readiness override for weights and artifacts. When unset, empty, or whitespace-only, both engines derive their health URLs from resolved serving settings. |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
-| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the torch compile cache `SourceIdentity`, adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the `SourceIdentity` of the torch compile cache and of the kernel JIT caches (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI), adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
+| `MX_COLD_START_FORMAT` | `auto` | vLLM only. Load format of the native disk fallback (`DefaultStrategy`, the server-cache path, and the vLLM loader's `download_model`/`load_weights`). `safetensors` refuses `.bin`/`.pt` checkpoints |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |
@@ -1151,6 +1288,19 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 ### NIXL_ERR_REMOTE_DISCONNECT
 
 Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source crashed/restarted (stale rkeys), UCX transport misconfiguration, premature target connection. Fix: use robust ready coordination, check for restarts, enable `UCX_LOG_LEVEL=DEBUG`.
+
+### Parameters in Host Memory
+
+Some models keep parameters in pinned host memory, such as the DeepSeek V4.1 Engram tables.
+
+The vLLM and SGLang adapters discover these parameters (`EngineAdapter.discovers_host_parameters()`). On the NIXL transport they move as NIXL DRAM next to the GPU weights. SGLang's `transfer_engine` transport registers them with Mooncake, which, at the time of writing, detects host memory itself. Host buffers are not collected.
+
+A guard in `register_tensors()` keeps a target from serving initial values for parameters that discovery does not collect. It skips NIXL registration when the model has a non-empty parameter that is:
+
+- For engines that discover host parameters: in neither accelerator nor host memory, for example left on `meta`.
+- For other engines: outside accelerator memory, including host memory.
+
+The worker then serves inference but never publishes itself as a P2P source, and a target falls back to the next strategy instead of receiving. This applies to TensorRT-LLM models with host parameters, such as DeepSeek V4, whose Engram tables are, at the time of writing, always in host memory.
 
 ### Long Source Warmup
 
@@ -1183,8 +1333,133 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 
 ## RL staged transfer
 
-The bounded arena design, logical and physical transfer plans, descriptor caching, checksum verification, and failure cleanup are covered in the [RL refit architecture](rl/ARCHITECTURE.md#staged-transfer-caching-and-failure-handling).
+Trainer refit compiles source geometry separately from NIXL execution and installs
+weights at the engine's safe point. See the [RL refit architecture](rl/ARCHITECTURE.md#refit-class-responsibilities)
+for ownership boundaries, [bounded staging and replay](rl/ARCHITECTURE.md#staged-transfer-caching-and-failure-handling),
+and failure handling.
 
+
+## Inference CI correctness
+
+`ci/k8s/client/inference_parity.py` runs pinned AIPerf's built-in MMLU
+loader and multiple-choice grader: eight subjects with 16 test questions each,
+one-shot chat prompting, thinking disabled, greedy decoding, an explicit single-letter system instruction, and an eight-token
+answer cap. Per-subject invocations preserve the balanced 128-question
+subset. Messages and ground truths must match across source and P2P target.
+Standalone P2P CI captures the source baseline before target deployment and
+reuses it after transfer, so invalid source answers fail before target startup.
+A one-sided exact paired test rejects target score regressions with `p < 0.01`;
+output wording and per-question correctness differences are retained as
+diagnostics. This is a regression smoke test, not a non-inferiority guarantee.
+At least 95% of answers on each worker must parse as A/B/C/D, separately from
+AIPerf's regex-fallback count. Missing, duplicate, failed, empty, or invalid
+request/grade records fail independently of the score. The shared model is
+`Qwen/Qwen3.5-0.8B`; explicit inference CI context limits are 2,048 tokens
+to leave prompt headroom while preserving fixed KV-cache capacities.
+MLA TP2 and expert-parallel lanes use
+`zai-org/GLM-4.7-Flash` for both engines. SGLang GLM manifests set
+`MX_MS_DISTRIBUTED=0` to avoid the distributed streamer buffer-ownership issue,
+while retaining TP2, EP2, and NIXL RDMA transfer. This configuration awaits GPU
+qualification; the distributed streamed-weight ownership fix remains separate.
+MTP lanes additionally run two 128-token chat generations per worker to exercise
+sustained decoding without requiring identical text. Per-subject wall timings
+include AIPerf startup and dataset loading. Accuracy runs disable unused
+server-metrics discovery and GPU telemetry. Each subject process has a 60-second
+startup allowance plus 300 seconds per request. Timeouts kill its process group
+and retain logs and timing. Target profiling errors enter the same replay and
+worker-diagnostic path as score regressions. Long-decode reports create their
+output directory independently of parity checks.
+
+Dynamo accuracy checks retry frontend discovery for the source and wait for a
+successful chat request pinned to each newly discovered target before profiling
+it. Requests pin only `nvext.decode_worker_id`;
+`backend_instance_id` would also constrain prefill routing to the decode ID in
+disaggregated deployments. The returned decode worker ID is checked on every
+response. Discovery through `/health` alone does
+not prove that the chat router can dispatch to the worker. SGLang's MX loader
+attaches the engine's namespace handlers, or root handlers when SGLang uses
+root logging, without duplicate propagation in scheduler subprocesses so transfer
+evidence remains visible under Dynamo's custom logging configuration.
+The CI Dynamo launcher first fetches all non-weight HF siblings, including the
+safetensors index, so native source loading and target P2P loading start with
+the same metadata inventory for deployment-card compatibility. It then replaces
+itself with the upstream Dynamo entrypoint; weight transfer stays engine-owned.
+Worker discovery cards are captured as a best-effort diagnostic artifact;
+a failed capture does not prevent the functional tests from running.
+
+The standalone vLLM CI image installs Ray explicitly and verifies its CLI at
+build time for cross-node TP. The vLLM Dynamo disaggregated manifest sets
+`VLLM_SSM_CONV_STATE_LAYOUT=DS` on both prefill and decode workers, as required
+by the runtime's NIXL connector for Qwen3.5 hybrid-state transfer.
+
+NIXL API resolution prefers the CUDA-specific wheel matching PyTorch's build
+CUDA major, with the legacy/meta package as fallback. It does not explicitly
+probe another CUDA major when the build version is known. This prevents a CUDA
+12 process from loading CUDA 13 UCX libraries when both wheel families exist.
+
+The benchmark uses AIPerf's built-in MMLU newline stop without model-specific
+stop overrides or dependency patches. CPU CI runs `test_aiperf_payload.py` against
+the pinned dependency, checking its real dataset-loader and endpoint-formatter
+output. The Python client CI jobs also run the Torch-based weight-audit tests.
+
+On a standalone parity failure, the test retains three repeated completions
+with token log-probabilities, worker hardware details, and worker logs. The
+standalone vLLM CI image also installs an opt-in loader audit; the Qwen base
+and MTP manifests enable `MX_CI_WEIGHT_DIGESTS=1`. It logs SHA-256 hashes of
+the loaded registered transfer catalog before warmup, including shapes and
+dtypes. It excludes temporary draft embeddings that vLLM replaces with the
+main model's transferred embedding. Instrumented source/target catalogs must
+match in a separate byte-integrity test, independently of MMLU scores. Workers
+without this CI instrumentation explicitly skip that test. The audit copies
+one tensor at a time to CPU and does not modify the production loader.
+
+Dynamo worker images and frontends are pinned to release 1.5.1 for both vLLM
+and SGLang. Aggregated and disaggregated serving each exercise worker scaling
+and parity. Standalone SGLang also has cross-node TP2, native DP2, GLM-4.7-Flash EP2,
+and Qwen3.5 EAGLE/MTP lanes. The MTP lane pins the same immutable checkpoint
+revision for the main and draft models and requires both transfers to use RDMA.
+The SGLang MTP lane disables radix caching because the pinned runtime does not
+support its default Mamba cache strategy with speculative decoding. Dynamo
+image overlays install as root into the engine environment, then restore the
+`dynamo` runtime user. Standalone vLLM Qwen lanes cap concurrent sequences and
+CUDA-graph capture sizes at 16 to keep warmup batches within the small fixed
+cache budget while retaining compilation and cache-reuse checks. The standalone
+vLLM base and MTP lanes set GPU memory utilization to 0.85 so the default
+90% startup reservation does not reject a nearly full 10 GB GPU slice. These
+configured lanes require GPU CI qualification. Readiness polling accepts a
+successful health probe without requiring an immediate duplicate probe. Dynamo
+scenario names are bounded so the combined namespace/deployment Grove label
+fits Kubernetes' 63-character limit.
+
+After Dynamo scales, worker containers have a separate bounded 900-second
+startup wait before the transfer/startup deadline begins. Scheduling and image
+pulls therefore do not consume the transfer budget. Full current and previous
+container logs are collected before artifact upload, preserving early transfer
+evidence even when repeated health-check failures dominate the end of the log.
+
+Dynamo captures its baseline and advertised generation-worker IDs before
+scaling. It waits for the frontend `/health` discovery list to add one worker,
+explicitly routes target requests through `nvext`, and checks
+the serving ID in every response. Standalone P2P tests address the source and
+target pods directly. Native DP cores behind one endpoint remain a coverage
+limit: this check cannot select each internal core separately.
+
+When standalone parity fails, CI replays the first differing prompt three times
+on each worker with token log-probabilities. It retains the original comparison
+and captures worker image, node, and GPU details to distinguish repeatability
+problems from transfer-specific divergence. Diagnostic failures do not replace
+the parity failure.
+
+The CI dependency project in `ci/pyproject.toml` keeps AIPerf on the control
+runner, separate from the inference engines' Torch/CUDA environments. Comparison
+reports, raw AIPerf exports, commands, and logs are uploaded on success or failure.
+Native MMLU accuracy summaries and per-example grades are retained alongside
+the inputs and message/ground-truth hashes. Hugging Face caches the dataset
+between runs. The built-in loader resolves the dataset's `main` revision;
+source/target input drift fails the comparison. No absolute accuracy threshold
+is imposed on these small models, and this subset does not cover every MoE
+expert. See [the CI test plan](../ci/TEST_PLAN.md)
+for qualification limits.
 
 ## RL refit CI harness
 
